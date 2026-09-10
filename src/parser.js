@@ -2,6 +2,7 @@ import * as cheerio from 'cheerio';
 
 /* ============================================================
    CORVITAL PLUS — SUPLIFUL DESCRIPTION PARSER
+   STAGE 1: STRUCTURED INGREDIENT HIGHLIGHTS
    ------------------------------------------------------------
    Goals:
    - Preserve real marketing paragraphs
@@ -10,6 +11,7 @@ import * as cheerio from 'cheerio';
    - Extract product attributes / certifications
    - Normalize product amount + weight formatting
    - Preserve source ingredient values
+   - NEW: generate deterministic ingredient highlights
 ============================================================ */
 
 
@@ -175,7 +177,10 @@ export const METAFIELD_TYPES = {
 
   fda_disclaimer: 'multi_line_text_field',
 
-  product_attributes: 'list.single_line_text_field'
+  product_attributes: 'list.single_line_text_field',
+
+  /* NEW — Stage 1 */
+  ingredient_highlights: 'json'
 };
 
 
@@ -240,53 +245,27 @@ function normalizeWhitespace(value) {
 }
 
 
-/*
-   IMPORTANT:
-
-   This function preserves REAL paragraphs.
-
-   <br> is treated as a SPACE.
-   </p> / block elements create paragraph separation.
-
-   This prevents:
-
-   "Your hair, skin, and nails...
-    Hair, Skin & Nails Essentials...
-    are formulated..."
-
-   and produces:
-
-   "Your hair, skin, and nails... Hair, Skin & Nails Essentials
-    Capsules are formulated..."
-
-   while preserving actual paragraph boundaries.
-*/
+/* ============================================================
+   MARKETING DESCRIPTION HTML -> TEXT
+============================================================ */
 
 function htmlToParagraphText(html) {
   const $ = cheerio.load(html || '', null, false);
 
-  /* Images don't belong in clean description text. */
   $('img').remove();
 
   /*
-    Cosmetic line breaks inside paragraphs should NOT
-    become paragraph breaks.
+    Cosmetic <br> tags become spaces.
   */
   $('br').replaceWith(' ');
 
   /*
-    Add explicit paragraph separators after genuine
-    block-level content.
-
-    Two newlines are intentional.
+    Actual block elements become paragraph boundaries.
   */
   $('p,div,h1,h2,h3,h4,h5,h6,blockquote').each((_, el) => {
     $(el).append('\n\n');
   });
 
-  /*
-    List items remain individual lines.
-  */
   $('li').each((_, el) => {
     $(el).append('\n');
   });
@@ -296,53 +275,26 @@ function htmlToParagraphText(html) {
   text = text
     .replace(/\u00a0/g, ' ')
     .replace(/\r/g, '')
-
-    /* Normalize spaces without touching newlines. */
     .replace(/[ \t]+/g, ' ')
-
-    /* Remove spaces surrounding newline boundaries. */
     .replace(/ *\n */g, '\n')
-
-    /* 3+ newlines = one paragraph break. */
     .replace(/\n{3,}/g, '\n\n')
-
     .trim();
 
   return text;
 }
 
 
-/*
-   This version is intentionally used for parsing
-   labeled Supliful fields.
-
-   Unlike the marketing-description parser above,
-   labels need to be placed on separate lines so
-   detectHeading() can recognize them.
-*/
+/* ============================================================
+   STRUCTURED SECTION HTML -> TEXT
+============================================================ */
 
 function htmlToSectionText(html) {
   const $ = cheerio.load(html || '', null, false);
 
-  /*
-    Put bold Supliful labels on their own logical lines.
-
-    Example:
-
-    <strong>Ingredients:</strong> Magnesium...
-
-    becomes approximately:
-
-    Ingredients:
-    Magnesium...
-  */
   $('strong,b').each((_, el) => {
     $(el).before('\n').after('\n');
   });
 
-  /*
-    For structured parsing, BR tags are useful boundaries.
-  */
   $('br').replaceWith('\n');
 
   $('p,div,li,h1,h2,h3,h4,h5,h6').each((_, el) => {
@@ -389,7 +341,6 @@ function extractAttributes(html) {
   };
 
 
-  /* Image metadata */
   $('img').each((_, el) => {
     add($(el).attr('alt'));
     add($(el).attr('title'));
@@ -397,7 +348,6 @@ function extractAttributes(html) {
   });
 
 
-  /* Linked badges / icons */
   $('a').each((_, el) => {
     add($(el).text());
     add($(el).attr('title'));
@@ -413,12 +363,6 @@ function extractAttributes(html) {
   });
 
 
-  /*
-    Whitelist fallback.
-
-    This handles descriptions where Shopify/Supliful
-    flattens badge labels into unusual HTML.
-  */
   const source =
     `${$.root().text()} ${html || ''}`;
 
@@ -451,7 +395,6 @@ function extractAttributes(html) {
 function normalizeUnits(value) {
   return String(value || '')
 
-    /* Remove heading residue such as "(oz/lb/g):" */
     .replace(
       /^\s*\(\s*oz\s*\/\s*lbs?\s*\/\s*g\s*\)\s*:\s*/i,
       ''
@@ -462,14 +405,6 @@ function normalizeUnits(value) {
       ''
     )
 
-    /*
-      Normalize:
-      1.3oz  -> 1.3 oz
-      0.25lb -> 0.25 lb
-      177ml  -> 177 ml
-
-      This is intentionally NOT applied to ingredients.
-    */
     .replace(
       /(\d)\s*(oz|lbs?|g|mg|mcg|ml)\b/gi,
       '$1 $2'
@@ -494,12 +429,6 @@ function cleanValue(key, value) {
     .trim();
 
 
-  /*
-    Product amount and gross weight can safely have
-    unit spacing normalized.
-
-    Ingredients remain untouched.
-  */
   if (
     key === 'product_amount' ||
     key === 'gross_weight'
@@ -508,9 +437,6 @@ function cleanValue(key, value) {
   }
 
 
-  /*
-    Clean FDA disclaimer punctuation.
-  */
   if (key === 'fda_disclaimer') {
     v = v
       .replace(/^\*+/, '')
@@ -528,13 +454,6 @@ function cleanValue(key, value) {
   }
 
 
-  /*
-    Structured fields should not contain accidental
-    formatting newlines.
-
-    Multi-line fields can preserve intentional paragraphs,
-    but random single newlines are converted to spaces.
-  */
   if (
     METAFIELD_TYPES[key] === 'multi_line_text_field'
   ) {
@@ -571,10 +490,6 @@ function detectHeading(line) {
   if (!raw) return null;
 
 
-  /* ----------------------------------------------------------
-     FDA disclaimer
-  ---------------------------------------------------------- */
-
   const fda = raw.match(
     /^\*?\s*these statements have not been evaluated by the food and drug administration\.?\s*(.*)$/i
   );
@@ -589,25 +504,10 @@ function detectHeading(line) {
   }
 
 
-  /* ----------------------------------------------------------
-     Normal structured headings
-  ---------------------------------------------------------- */
-
   for (const def of SECTION_DEFS) {
     for (const alias of def.aliases) {
       const escaped = escapeRegex(alias);
 
-
-      /*
-        Supports:
-
-        Product amount: 60 capsules
-
-        Product amount (oz/lb/g):
-        60 capsules...
-
-        Gross weight (oz/lb/g): 2.4 oz...
-      */
       const withColon = new RegExp(
         `^\\*?\\s*${escaped}(?:\\s*\\([^)]*\\))?\\s*:\\s*(.*)$`,
         'i'
@@ -624,15 +524,6 @@ function detectHeading(line) {
       }
 
 
-      /*
-        Supports headings flattened onto their own line:
-
-        Ingredients
-
-        Amount
-
-        Warning
-      */
       const standalone = new RegExp(
         `^\\*?\\s*${escaped}(?:\\s*\\([^)]*\\))?\\s*$`,
         'i'
@@ -654,16 +545,8 @@ function detectHeading(line) {
 
 
 /* ============================================================
-   FIND WHERE STRUCTURED SUPLIFUL DATA BEGINS
+   FIND FIRST STRUCTURED SECTION
 ============================================================ */
-
-/*
-   We use the section-parser representation only to determine
-   where the marketing description ends.
-
-   This prevents Ingredients, Manufacturer Country, etc.
-   from leaking into description_clean.
-*/
 
 function findFirstStructuredHeadingLine(sectionText) {
   const lines = String(sectionText || '')
@@ -697,9 +580,6 @@ function cleanMarketingDescription(value) {
     .replace(/\r/g, '');
 
 
-  /*
-    Normalize spaces inside paragraphs.
-  */
   text = text
     .split(/\n{2,}/)
     .map((paragraph) => {
@@ -712,9 +592,6 @@ function cleanMarketingDescription(value) {
     .join('\n\n');
 
 
-  /*
-    Remove trailing Supliful structure asterisk.
-  */
   text = text
     .replace(/\*+\s*$/, '')
     .trim();
@@ -725,7 +602,7 @@ function cleanMarketingDescription(value) {
 
 
 /* ============================================================
-   EXTRACT CLEAN MARKETING DESCRIPTION FROM ORIGINAL HTML
+   EXTRACT MARKETING DESCRIPTION
 ============================================================ */
 
 function extractMarketingDescription(descriptionHtml) {
@@ -736,19 +613,8 @@ function extractMarketingDescription(descriptionHtml) {
   );
 
 
-  /*
-    Remove attribute badges/images before processing.
-  */
   $('img').remove();
 
-
-  /*
-    Find the first element containing a recognized structured
-    heading such as Ingredients, Manufacturer Country, etc.
-
-    Everything from this element onward belongs to the
-    structured Supliful section rather than marketing copy.
-  */
   let firstStructuredNode = null;
 
 
@@ -766,10 +632,6 @@ function extractMarketingDescription(descriptionHtml) {
   });
 
 
-  /*
-    If the label wasn't isolated inside <strong>, check
-    block elements too.
-  */
   if (!firstStructuredNode) {
     $('p,div,li,h1,h2,h3,h4,h5,h6').each((_, el) => {
       if (firstStructuredNode) return;
@@ -779,11 +641,6 @@ function extractMarketingDescription(descriptionHtml) {
         .replace(/\u00a0/g, ' ')
         .trim();
 
-      /*
-        Only inspect the beginning of the block so an entire
-        parent DIV containing the whole description doesn't
-        get falsely selected.
-      */
       const firstPart = text.slice(0, 200);
 
       if (detectHeading(firstPart)) {
@@ -793,15 +650,9 @@ function extractMarketingDescription(descriptionHtml) {
   }
 
 
-  /*
-    Remove structured content from the marketing-copy clone.
-  */
   if (firstStructuredNode) {
     let node = $(firstStructuredNode);
 
-    /*
-      Prefer the nearest paragraph/block containing the label.
-    */
     const block = node.closest(
       'p,li,h1,h2,h3,h4,h5,h6'
     );
@@ -810,10 +661,6 @@ function extractMarketingDescription(descriptionHtml) {
       node = block;
     }
 
-
-    /*
-      Remove this node and all following siblings at its level.
-    */
     node.nextAll().remove();
     node.remove();
   }
@@ -828,13 +675,628 @@ function extractMarketingDescription(descriptionHtml) {
 
 
 /* ============================================================
+   STAGE 1 — INGREDIENT HIGHLIGHT EXTRACTION
+============================================================ */
+
+
+/*
+   We deliberately avoid using a simple:
+
+   ingredients.split(',')
+
+   because ingredient names often contain commas INSIDE
+   parentheses.
+
+   Example:
+
+   Proprietary Blend (PABA, Horsetail, Fo-Ti, Bamboo)
+
+   must remain ONE ingredient.
+
+   This splitter only separates commas at the top level.
+*/
+
+function splitTopLevelIngredients(value) {
+  const source = String(value || '').trim();
+
+  if (!source) return [];
+
+  const parts = [];
+
+  let buffer = '';
+  let roundDepth = 0;
+  let squareDepth = 0;
+  let curlyDepth = 0;
+
+  for (let i = 0; i < source.length; i++) {
+    const char = source[i];
+
+    if (char === '(') roundDepth++;
+    else if (char === ')') {
+      roundDepth = Math.max(0, roundDepth - 1);
+    }
+
+    else if (char === '[') squareDepth++;
+    else if (char === ']') {
+      squareDepth = Math.max(0, squareDepth - 1);
+    }
+
+    else if (char === '{') curlyDepth++;
+    else if (char === '}') {
+      curlyDepth = Math.max(0, curlyDepth - 1);
+    }
+
+
+    const atTopLevel =
+      roundDepth === 0 &&
+      squareDepth === 0 &&
+      curlyDepth === 0;
+
+
+    if (
+      char === ',' &&
+      atTopLevel
+    ) {
+      const item = buffer.trim();
+
+      if (item) {
+        parts.push(item);
+      }
+
+      buffer = '';
+      continue;
+    }
+
+
+    buffer += char;
+  }
+
+
+  const lastItem = buffer.trim();
+
+  if (lastItem) {
+    parts.push(lastItem);
+  }
+
+
+  return parts;
+}
+
+
+/* ============================================================
+   INGREDIENT CLASSIFICATION HELPERS
+============================================================ */
+
+const CAPSULE_PATTERNS = [
+  /\bhpmc\b/i,
+  /\bhypromellose\b/i,
+  /\bvegetable capsule\b/i,
+  /\bvegetarian capsule\b/i,
+  /\bvegan capsule\b/i,
+  /\bcapsule shell\b/i,
+  /\bgelatin capsule\b/i
+];
+
+
+const EXCIPIENT_PATTERNS = [
+  /\bmagnesium stearate\b/i,
+  /\bsilicon dioxide\b/i,
+  /\bsilica\b/i,
+  /\brice flour\b/i,
+  /\bbrown rice flour\b/i,
+  /\bmicrocrystalline cellulose\b/i,
+  /\bmcc\b/i,
+  /\bcellulose\b/i,
+  /\bstearic acid\b/i,
+  /\bcalcium silicate\b/i,
+  /\bmaltodextrin\b/i,
+  /\bleucine\b/i,
+  /\bvegetable oil\b/i,
+  /\bolive oil\b/i
+];
+
+
+function matchesAny(value, patterns) {
+  const source = String(value || '');
+
+  return patterns.some((pattern) =>
+    pattern.test(source)
+  );
+}
+
+
+function isCapsuleIngredient(value) {
+  return matchesAny(
+    value,
+    CAPSULE_PATTERNS
+  );
+}
+
+
+function isKnownExcipient(value) {
+  return matchesAny(
+    value,
+    EXCIPIENT_PATTERNS
+  );
+}
+
+
+/* ============================================================
+   EXTRACT AMOUNT FROM ONE INGREDIENT
+============================================================ */
+
+/*
+   Supports examples such as:
+
+   NAD+ (...) (500 mg)
+
+   Magnesium (...) 275mg
+
+   Vitamin A (...) 120mcg RAE
+
+   Folate 1496mcg DFE (880mcg Folic Acid)
+
+   CoQ10 200 mg
+
+   Vitamin D3 5000 IU
+*/
+
+function extractIngredientAmount(value) {
+  const source = String(value || '').trim();
+
+  if (!source) {
+    return {
+      amount: '',
+      name: ''
+    };
+  }
+
+
+  /*
+    First preference:
+    final parenthetical amount.
+
+    Example:
+    NAD+ (...) (500 mg)
+  */
+  const finalParenAmount = source.match(
+    /\(\s*([\d,.]+\s*(?:mg|mcg|g|iu|cfu|ml|µg)(?:\s+(?:RAE|DFE))?)\s*\)\s*\.?$/i
+  );
+
+  if (finalParenAmount) {
+    const amount =
+      normalizeIngredientAmount(
+        finalParenAmount[1]
+      );
+
+    const name = source
+      .slice(
+        0,
+        finalParenAmount.index
+      )
+      .trim()
+      .replace(/[;,]+$/, '')
+      .trim();
+
+    return {
+      amount,
+      name
+    };
+  }
+
+
+  /*
+    End-of-entry amount.
+
+    Examples:
+    Magnesium (...) 275mg
+    Vitamin D3 5000 IU
+    Vitamin A (...) 120mcg RAE
+  */
+  const endingAmount = source.match(
+    /([\d,.]+\s*(?:mg|mcg|g|iu|cfu|ml|µg)(?:\s+(?:RAE|DFE))?)\s*\.?$/i
+  );
+
+  if (endingAmount) {
+    const amount =
+      normalizeIngredientAmount(
+        endingAmount[1]
+      );
+
+    const name = source
+      .slice(
+        0,
+        endingAmount.index
+      )
+      .trim()
+      .replace(/[;,]+$/, '')
+      .trim();
+
+    return {
+      amount,
+      name
+    };
+  }
+
+
+  return {
+    amount: '',
+    name: source
+      .replace(/[;,]+$/, '')
+      .trim()
+  };
+}
+
+
+function normalizeIngredientAmount(value) {
+  return String(value || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(
+      /([\d,.])\s*(mg|mcg|g|iu|cfu|ml|µg)\b/gi,
+      '$1 $2'
+    )
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+
+/* ============================================================
+   CLEAN DISPLAY NAME
+============================================================ */
+
+function cleanIngredientDisplayName(value) {
+  return String(value || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/^[,;:\-\s]+/, '')
+    .replace(/[,;:\-\s]+$/, '')
+    .trim();
+}
+
+
+/* ============================================================
+   CAPSULE DETAIL
+============================================================ */
+
+function getCapsuleDetail(value) {
+  const source = String(value || '');
+
+  if (
+    /hpmc|hypromellose|vegetable capsule|vegetarian capsule|vegan capsule/i.test(
+      source
+    )
+  ) {
+    return 'Vegetable capsule';
+  }
+
+
+  if (/gelatin capsule/i.test(source)) {
+    return 'Gelatin capsule';
+  }
+
+
+  if (/capsule shell/i.test(source)) {
+    return 'Capsule shell';
+  }
+
+
+  return 'Capsule material';
+}
+
+
+/* ============================================================
+   PARSE ONE INGREDIENT
+============================================================ */
+
+function parseIngredientEntry(entry, sourceIndex) {
+  const raw =
+    cleanIngredientDisplayName(entry);
+
+  if (!raw) return null;
+
+
+  const {
+    amount,
+    name: extractedName
+  } = extractIngredientAmount(raw);
+
+
+  let name =
+    cleanIngredientDisplayName(
+      extractedName
+    );
+
+
+  if (!name) {
+    name = raw;
+  }
+
+
+  let kind = 'ingredient';
+  let detail = '';
+
+
+  if (isCapsuleIngredient(raw)) {
+    kind = 'capsule';
+    detail = getCapsuleDetail(raw);
+
+
+    /*
+      Clean common capsule wording for display.
+
+      Example:
+
+      HPMC (vegetable capsule)
+      becomes:
+      name = HPMC
+      detail = Vegetable capsule
+    */
+    name = name
+      .replace(
+        /\s*\((?:vegetable|vegetarian|vegan)\s+capsule\)\s*/i,
+        ''
+      )
+      .replace(
+        /\s*\(capsule\)\s*/i,
+        ''
+      )
+      .trim();
+  }
+
+  else if (amount) {
+    /*
+      Explicit dosage is our strongest deterministic
+      indication that this is a highlighted active/nutrient.
+    */
+    kind = 'active';
+  }
+
+  else if (isKnownExcipient(raw)) {
+    kind = 'other';
+    detail = 'Other ingredient';
+  }
+
+  else {
+    /*
+      No amount and not a known excipient.
+
+      We intentionally call this simply "ingredient",
+      not "active", because we do not want the parser
+      to make an unsupported classification.
+    */
+    kind = 'ingredient';
+  }
+
+
+  return {
+    name,
+    amount,
+    detail,
+    kind,
+    source_index: sourceIndex
+  };
+}
+
+
+/* ============================================================
+   SELECT INGREDIENT HIGHLIGHTS
+============================================================ */
+
+/*
+   Maximum displayed highlight candidates.
+
+   We are storing the selected candidates now.
+   Later our "Inside the Capsule" Liquid section will
+   render these automatically.
+*/
+
+const MAX_INGREDIENT_HIGHLIGHTS = 4;
+
+
+function selectIngredientHighlights(entries) {
+  const valid = entries.filter(Boolean);
+
+  if (!valid.length) return [];
+
+
+  const actives =
+    valid.filter(
+      (entry) =>
+        entry.kind === 'active'
+    );
+
+
+  const normalIngredients =
+    valid.filter(
+      (entry) =>
+        entry.kind === 'ingredient'
+    );
+
+
+  const capsules =
+    valid.filter(
+      (entry) =>
+        entry.kind === 'capsule'
+    );
+
+
+  const others =
+    valid.filter(
+      (entry) =>
+        entry.kind === 'other'
+    );
+
+
+  /*
+    Priority:
+
+    1. Ingredients with explicit amounts
+    2. Formula ingredients without explicit amounts
+    3. Capsule material
+    4. Other/excipient ingredients
+
+    This means:
+
+    NAD+:
+      NAD+
+      Quercetin
+      Japanese Knotweed
+      HPMC
+
+    Turmeric:
+      Turmeric Root
+      Glucosamine
+      Turmeric Curcuminoids
+      Ginger
+
+    Simple single-active formula:
+      Active
+      capsule
+      other
+      other
+  */
+
+  const ordered = [
+    ...actives,
+    ...normalIngredients,
+    ...capsules,
+    ...others
+  ];
+
+
+  const selected = [];
+  const seen = new Set();
+
+
+  for (const entry of ordered) {
+    if (
+      selected.length >=
+      MAX_INGREDIENT_HIGHLIGHTS
+    ) {
+      break;
+    }
+
+
+    const dedupeKey =
+      entry.name
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim();
+
+
+    if (!dedupeKey) continue;
+
+    if (seen.has(dedupeKey)) {
+      continue;
+    }
+
+
+    seen.add(dedupeKey);
+
+
+    selected.push({
+      name: entry.name,
+      amount: entry.amount || '',
+      detail: entry.detail || '',
+      kind: entry.kind
+    });
+  }
+
+
+  return selected;
+}
+
+
+/* ============================================================
+   EXTRACT INGREDIENT HIGHLIGHTS FROM FULL INGREDIENT STRING
+============================================================ */
+
+function extractIngredientHighlights(
+  ingredients,
+  otherIngredients = ''
+) {
+  const primaryParts =
+    splitTopLevelIngredients(
+      ingredients
+    );
+
+
+  const secondaryParts =
+    splitTopLevelIngredients(
+      otherIngredients
+    );
+
+
+  const parsed = [];
+
+
+  primaryParts.forEach(
+    (entry, index) => {
+      const item =
+        parseIngredientEntry(
+          entry,
+          index
+        );
+
+      if (item) {
+        parsed.push(item);
+      }
+    }
+  );
+
+
+  /*
+    Other Ingredients are appended AFTER primary ingredients.
+
+    This prevents secondary excipients from taking priority
+    over the actual formula ingredients.
+  */
+  secondaryParts.forEach(
+    (entry, index) => {
+      const item =
+        parseIngredientEntry(
+          entry,
+          primaryParts.length + index
+        );
+
+      if (item) {
+        /*
+          If this came specifically from an
+          Other Ingredients section and doesn't have an amount,
+          treat it as an "other" ingredient unless it's
+          explicitly capsule material.
+        */
+        if (
+          item.kind === 'ingredient'
+        ) {
+          item.kind = 'other';
+
+          if (!item.detail) {
+            item.detail =
+              'Other ingredient';
+          }
+        }
+
+        parsed.push(item);
+      }
+    }
+  );
+
+
+  return selectIngredientHighlights(
+    parsed
+  );
+}
+
+
+/* ============================================================
    MAIN PARSER
 ============================================================ */
 
 export function parseSuplifulDescription(descriptionHtml) {
 
   /* ----------------------------------------------------------
-     1. Extract attributes from ORIGINAL HTML
+     1. Extract attributes
   ---------------------------------------------------------- */
 
   const attributes =
@@ -846,7 +1308,9 @@ export function parseSuplifulDescription(descriptionHtml) {
   ---------------------------------------------------------- */
 
   const sectionText =
-    htmlToSectionText(descriptionHtml);
+    htmlToSectionText(
+      descriptionHtml
+    );
 
 
   const lines = sectionText
@@ -862,7 +1326,7 @@ export function parseSuplifulDescription(descriptionHtml) {
 
 
   /* ----------------------------------------------------------
-     Flush currently collected structured section
+     Flush structured field
   ---------------------------------------------------------- */
 
   const flush = () => {
@@ -876,12 +1340,19 @@ export function parseSuplifulDescription(descriptionHtml) {
       .join('\n')
       .trim();
 
+
     const cleaned =
-      cleanValue(current.key, combined);
+      cleanValue(
+        current.key,
+        combined
+      );
+
 
     if (cleaned) {
-      result[current.key] = cleaned;
+      result[current.key] =
+        cleaned;
     }
+
 
     current = null;
     bucket = [];
@@ -889,27 +1360,23 @@ export function parseSuplifulDescription(descriptionHtml) {
 
 
   /* ----------------------------------------------------------
-     3. Parse structured sections
+     3. Parse structured fields
   ---------------------------------------------------------- */
 
   for (const line of lines) {
     const heading =
       detectHeading(line);
 
+
     if (heading) {
       flush();
 
       current = heading;
+
       continue;
     }
 
 
-    /*
-      Ignore marketing-copy lines here.
-
-      Marketing description is extracted separately from
-      original HTML below so its paragraph structure survives.
-    */
     if (current) {
       bucket.push(line);
     }
@@ -920,7 +1387,7 @@ export function parseSuplifulDescription(descriptionHtml) {
 
 
   /* ----------------------------------------------------------
-     4. Extract marketing description independently
+     4. Marketing description
   ---------------------------------------------------------- */
 
   let description =
@@ -929,21 +1396,27 @@ export function parseSuplifulDescription(descriptionHtml) {
     );
 
 
-  /*
-    Fallback for unusual Supliful HTML where DOM-based
-    extraction could not isolate the marketing section.
-  */
   if (!description) {
     const headingInfo =
-      findFirstStructuredHeadingLine(sectionText);
+      findFirstStructuredHeadingLine(
+        sectionText
+      );
+
 
     if (headingInfo.index > 0) {
-      description = headingInfo.lines
-        .slice(0, headingInfo.index)
-        .join(' ');
+      description =
+        headingInfo.lines
+          .slice(
+            0,
+            headingInfo.index
+          )
+          .join(' ');
+
 
       description =
-        cleanMarketingDescription(description);
+        cleanMarketingDescription(
+          description
+        );
     }
   }
 
@@ -964,6 +1437,28 @@ export function parseSuplifulDescription(descriptionHtml) {
   }
 
 
+  /* ----------------------------------------------------------
+     6. NEW — Ingredient Highlights
+  ---------------------------------------------------------- */
+
+  if (
+    result.ingredients ||
+    result.other_ingredients
+  ) {
+    const ingredientHighlights =
+      extractIngredientHighlights(
+        result.ingredients || '',
+        result.other_ingredients || ''
+      );
+
+
+    if (ingredientHighlights.length) {
+      result.ingredient_highlights =
+        ingredientHighlights;
+    }
+  }
+
+
   return result;
 }
 
@@ -975,9 +1470,21 @@ export function parseSuplifulDescription(descriptionHtml) {
 export function toMetafieldValue(key, value) {
 
   /*
-    Shopify list metafields expect JSON arrays.
+    Shopify list metafield.
   */
   if (key === 'product_attributes') {
+    return JSON.stringify(
+      Array.isArray(value)
+        ? value
+        : []
+    );
+  }
+
+
+  /*
+    Stage 1 structured ingredient JSON.
+  */
+  if (key === 'ingredient_highlights') {
     return JSON.stringify(
       Array.isArray(value)
         ? value
