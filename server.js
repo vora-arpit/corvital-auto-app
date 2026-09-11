@@ -2,24 +2,41 @@ import crypto from 'node:crypto';
 import express from 'express';
 
 import { config } from './src/config.js';
-import { syncProduct } from './src/sync-product.js';
+
+import {
+  syncProduct,
+  generateProductCapsuleDraft
+} from './src/sync-product.js';
 
 const app = express();
 
-/*
-  Used only for short-term duplicate webhook protection.
-  Note: On Vercel this Map is not guaranteed to persist between invocations,
-  but Shopify webhook IDs plus idempotent metafield syncing give us another
-  layer of protection.
-*/
+/**
+ * Short-term duplicate webhook protection.
+ *
+ * Note:
+ * On Vercel this Map is not guaranteed to persist between
+ * different serverless invocations, but it is still useful
+ * during warm invocations.
+ *
+ * Our syncProduct() logic should also remain idempotent.
+ */
 const seenWebhookIds = new Map();
+
 
 /* ============================================================
    SHOPIFY WEBHOOK HMAC VERIFICATION
 ============================================================ */
 
-function verifyWithSecret(rawBody, receivedHmac, secret) {
-  if (!receivedHmac || !secret || !Buffer.isBuffer(rawBody)) {
+function verifyWithSecret(
+  rawBody,
+  receivedHmac,
+  secret
+) {
+  if (
+    !receivedHmac ||
+    !secret ||
+    !Buffer.isBuffer(rawBody)
+  ) {
     return false;
   }
 
@@ -30,26 +47,49 @@ function verifyWithSecret(rawBody, receivedHmac, secret) {
       .digest('base64');
 
     /*
-      Decode both Base64 values before timingSafeEqual.
-      This avoids comparing encoded text representations.
+      Decode both Base64 signatures before comparing them.
     */
-    const calculatedBuffer = Buffer.from(calculatedHmac, 'base64');
-    const receivedBuffer = Buffer.from(String(receivedHmac).trim(), 'base64');
+    const calculatedBuffer =
+      Buffer.from(
+        calculatedHmac,
+        'base64'
+      );
 
-    if (calculatedBuffer.length !== receivedBuffer.length) {
+    const receivedBuffer =
+      Buffer.from(
+        String(receivedHmac).trim(),
+        'base64'
+      );
+
+    if (
+      calculatedBuffer.length !==
+      receivedBuffer.length
+    ) {
       return false;
     }
 
-    return crypto.timingSafeEqual(calculatedBuffer, receivedBuffer);
+    return crypto.timingSafeEqual(
+      calculatedBuffer,
+      receivedBuffer
+    );
+
   } catch (error) {
-    console.error('[webhook] HMAC verification error:', error);
+    console.error(
+      '[webhook] HMAC verification error:',
+      error
+    );
+
     return false;
   }
 }
 
-function validWebhookHmac(rawBody, receivedHmac) {
+
+function validWebhookHmac(
+  rawBody,
+  receivedHmac
+) {
   /*
-    Primary/new secret.
+    Primary / current Shopify client secret.
   */
   if (
     verifyWithSecret(
@@ -62,15 +102,13 @@ function validWebhookHmac(rawBody, receivedHmac) {
   }
 
   /*
-    Optional OLD secret.
+    Optional old secret.
 
-    Keep this temporarily if you recently rotated your Shopify client secret.
-    Add SHOPIFY_OLD_CLIENT_SECRET in Vercel.
-
-    Once all webhook signatures are being generated using the new secret,
-    remove the old environment variable.
+    Keep this only while Shopify secret rotation is still
+    relevant. Later you can remove this environment variable.
   */
-  const oldSecret = process.env.SHOPIFY_OLD_CLIENT_SECRET;
+  const oldSecret =
+    process.env.SHOPIFY_OLD_CLIENT_SECRET;
 
   if (
     oldSecret &&
@@ -81,8 +119,7 @@ function validWebhookHmac(rawBody, receivedHmac) {
     )
   ) {
     console.log(
-      '[webhook] HMAC validated using OLD client secret. ' +
-      'Remove SHOPIFY_OLD_CLIENT_SECRET after Shopify finishes secret rotation.'
+      '[webhook] HMAC validated using OLD client secret.'
     );
 
     return true;
@@ -91,49 +128,76 @@ function validWebhookHmac(rawBody, receivedHmac) {
   return false;
 }
 
+
 /* ============================================================
    DUPLICATE WEBHOOK PROTECTION
 ============================================================ */
 
 function rememberWebhook(id) {
-  if (!id) return false;
+  if (!id) {
+    return false;
+  }
 
   const now = Date.now();
-  const ttl = 10 * 60 * 1000;
 
-  for (const [key, timestamp] of seenWebhookIds) {
-    if (now - timestamp > ttl) {
+  const ttl =
+    10 * 60 * 1000;
+
+  for (
+    const [key, timestamp]
+    of seenWebhookIds
+  ) {
+    if (
+      now - timestamp > ttl
+    ) {
       seenWebhookIds.delete(key);
     }
   }
 
-  if (seenWebhookIds.has(id)) {
+  if (
+    seenWebhookIds.has(id)
+  ) {
     return true;
   }
 
-  seenWebhookIds.set(id, now);
+  seenWebhookIds.set(
+    id,
+    now
+  );
 
   return false;
 }
+
 
 /* ============================================================
    HEALTH CHECK
 ============================================================ */
 
-app.get('/health', (_req, res) => {
-  res.status(200).json({
-    ok: true,
-    service: 'corvital-metafield-automation',
-    timestamp: new Date().toISOString()
-  });
-});
+app.get(
+  '/health',
+
+  (_req, res) => {
+    res
+      .status(200)
+      .json({
+        ok: true,
+        service:
+          'corvital-metafield-automation',
+        timestamp:
+          new Date().toISOString()
+      });
+  }
+);
+
 
 /* ============================================================
    SHOPIFY PRODUCT WEBHOOK
 
    IMPORTANT:
-   express.raw() MUST be used here.
-   Do not put express.json() before this route.
+   express.raw() MUST remain here.
+
+   Do NOT put express.json() above this webhook route,
+   otherwise Shopify HMAC validation can fail.
 ============================================================ */
 
 app.post(
@@ -145,19 +209,30 @@ app.post(
   }),
 
   async (req, res) => {
-    const rawBody = req.body;
+
+    const rawBody =
+      req.body;
 
     const hmac =
-      req.get('X-Shopify-Hmac-Sha256') || '';
+      req.get(
+        'X-Shopify-Hmac-Sha256'
+      ) || '';
 
     const topic =
-      req.get('X-Shopify-Topic') || 'unknown';
+      req.get(
+        'X-Shopify-Topic'
+      ) || 'unknown';
 
     const webhookId =
-      req.get('X-Shopify-Webhook-Id') || '';
+      req.get(
+        'X-Shopify-Webhook-Id'
+      ) || '';
 
     const shopDomain =
-      req.get('X-Shopify-Shop-Domain') || '';
+      req.get(
+        'X-Shopify-Shop-Domain'
+      ) || '';
+
 
     console.log(
       `[webhook] Received topic=${topic} ` +
@@ -165,63 +240,88 @@ app.post(
       `id=${webhookId || 'none'}`
     );
 
+
     /* --------------------------------------------------------
-       Validate raw request body
+       Validate raw body
     -------------------------------------------------------- */
 
-    if (!Buffer.isBuffer(rawBody)) {
+    if (
+      !Buffer.isBuffer(rawBody)
+    ) {
       console.error(
-        '[webhook] Request body was not a raw Buffer. ' +
-        'HMAC verification cannot be performed safely.'
+        '[webhook] Request body was not a raw Buffer.'
       );
 
       return res
         .status(400)
-        .send('Raw body required');
+        .send(
+          'Raw body required'
+        );
     }
+
 
     /* --------------------------------------------------------
        Verify Shopify signature
     -------------------------------------------------------- */
 
-    if (!validWebhookHmac(rawBody, hmac)) {
+    if (
+      !validWebhookHmac(
+        rawBody,
+        hmac
+      )
+    ) {
       console.warn(
         `[webhook] Invalid HMAC for topic=${topic}`
       );
 
       return res
         .status(401)
-        .send('Invalid HMAC');
+        .send(
+          'Invalid HMAC'
+        );
     }
+
 
     console.log(
       `[webhook] HMAC valid for topic=${topic}`
     );
 
+
     /* --------------------------------------------------------
        Ignore duplicate delivery
     -------------------------------------------------------- */
 
-    if (rememberWebhook(webhookId)) {
+    if (
+      rememberWebhook(
+        webhookId
+      )
+    ) {
       console.log(
         `[webhook] Duplicate ignored id=${webhookId}`
       );
 
       return res
         .status(200)
-        .send('Duplicate');
+        .send(
+          'Duplicate'
+        );
     }
 
+
     /* --------------------------------------------------------
-       Parse Shopify JSON only AFTER HMAC validation
+       Parse JSON only AFTER HMAC validation
     -------------------------------------------------------- */
 
     let payload;
 
     try {
-      payload = JSON.parse(
-        rawBody.toString('utf8')
-      );
+      payload =
+        JSON.parse(
+          rawBody.toString(
+            'utf8'
+          )
+        );
+
     } catch (error) {
       console.error(
         '[webhook] Invalid JSON payload:',
@@ -230,8 +330,11 @@ app.post(
 
       return res
         .status(400)
-        .send('Invalid JSON');
+        .send(
+          'Invalid JSON'
+        );
     }
+
 
     /* --------------------------------------------------------
        Resolve Shopify Product GID
@@ -245,25 +348,26 @@ app.post(
           : null
       );
 
+
     if (!gid) {
       console.warn(
         `[webhook] ${topic} contained no product ID`
       );
 
       /*
-        Return 200 so Shopify does not repeatedly retry
-        an unusable payload.
+        Return 200 so Shopify does not continuously retry
+        a payload that contains no usable product ID.
       */
       return res
         .status(200)
-        .send('No product id');
+        .send(
+          'No product id'
+        );
     }
 
-    /* --------------------------------------------------------
-       Process BEFORE finishing Vercel invocation.
 
-       Do not use setImmediate() here.
-       Vercel/serverless may stop execution after response.
+    /* --------------------------------------------------------
+       Process product sync
     -------------------------------------------------------- */
 
     try {
@@ -271,11 +375,17 @@ app.post(
         `[webhook] Processing ${topic} -> ${gid}`
       );
 
-      const result = await syncProduct(gid);
+
+      const result =
+        await syncProduct(
+          gid
+        );
+
 
       console.log(
         `[webhook] Completed ${topic} -> ${gid}`
       );
+
 
       if (result) {
         console.log(
@@ -284,9 +394,13 @@ app.post(
         );
       }
 
+
       return res
         .status(200)
-        .send('OK');
+        .send(
+          'OK'
+        );
+
 
     } catch (error) {
       console.error(
@@ -294,53 +408,287 @@ app.post(
         error
       );
 
+
       /*
-        500 tells Shopify the webhook failed.
-        Shopify can retry delivery.
+        Return 500 so Shopify knows processing failed.
       */
       return res
         .status(500)
-        .send('Product sync failed');
+        .send(
+          'Product sync failed'
+        );
     }
   }
 );
 
+
 /* ============================================================
-   JSON PARSER FOR ANY FUTURE NON-WEBHOOK ROUTES
+   NORMAL JSON PARSER
 
    IMPORTANT:
-   This is deliberately AFTER the webhook route.
+   This must stay AFTER the Shopify webhook route.
 ============================================================ */
 
-app.use(express.json());
+app.use(
+  express.json({
+    limit: '2mb'
+  })
+);
+
+
+/* ============================================================
+   MANUAL CAPSULE AI GENERATION
+   ------------------------------------------------------------
+   Stage 3 test endpoint
+
+   Example:
+   POST /admin/generate-capsule/1234567890
+
+   Required header:
+   X-Capsule-Generator-Secret
+============================================================ */
+
+app.post(
+  '/admin/generate-capsule/:productId',
+
+  async (req, res) => {
+
+    /* --------------------------------------------------------
+       Verify private generator secret
+    -------------------------------------------------------- */
+
+    const suppliedSecret =
+      req.get(
+        'X-Capsule-Generator-Secret'
+      );
+
+
+    const expectedSecret =
+      process.env
+        .CAPSULE_GENERATOR_SECRET;
+
+
+    if (
+      !expectedSecret ||
+      !suppliedSecret
+    ) {
+      console.warn(
+        '[capsule-ai] Unauthorized request: missing generator secret.'
+      );
+
+      return res
+        .status(401)
+        .json({
+          error:
+            'Unauthorized'
+        });
+    }
+
+
+    /*
+      Constant-time comparison for our private endpoint secret.
+    */
+    const suppliedBuffer =
+      Buffer.from(
+        String(
+          suppliedSecret
+        ),
+        'utf8'
+      );
+
+    const expectedBuffer =
+      Buffer.from(
+        String(
+          expectedSecret
+        ),
+        'utf8'
+      );
+
+
+    if (
+      suppliedBuffer.length !==
+      expectedBuffer.length
+    ) {
+      console.warn(
+        '[capsule-ai] Unauthorized request: invalid generator secret.'
+      );
+
+      return res
+        .status(401)
+        .json({
+          error:
+            'Unauthorized'
+        });
+    }
+
+
+    if (
+      !crypto.timingSafeEqual(
+        suppliedBuffer,
+        expectedBuffer
+      )
+    ) {
+      console.warn(
+        '[capsule-ai] Unauthorized request: invalid generator secret.'
+      );
+
+      return res
+        .status(401)
+        .json({
+          error:
+            'Unauthorized'
+        });
+    }
+
+
+    /* --------------------------------------------------------
+       Validate Shopify product ID
+    -------------------------------------------------------- */
+
+    const numericProductId =
+      String(
+        req.params.productId ||
+        ''
+      )
+        .trim();
+
+
+    if (
+      !/^\d+$/.test(
+        numericProductId
+      )
+    ) {
+      return res
+        .status(400)
+        .json({
+          error:
+            'Invalid Shopify product ID'
+        });
+    }
+
+
+    const productGid =
+      `gid://shopify/Product/${numericProductId}`;
+
+
+    /* --------------------------------------------------------
+       Generate capsule draft
+    -------------------------------------------------------- */
+
+    try {
+      console.log(
+        `[capsule-ai] Manual generation requested for ${productGid}`
+      );
+
+
+      const result =
+        await generateProductCapsuleDraft(
+          productGid
+        );
+
+
+      console.log(
+        `[capsule-ai] Manual generation completed for ${productGid}`
+      );
+
+
+      return res
+        .status(200)
+        .json(
+          result
+        );
+
+
+    } catch (error) {
+      console.error(
+        `[capsule-ai] Generation failed for ${productGid}:`,
+        error
+      );
+
+
+      return res
+        .status(500)
+        .json({
+          error:
+            error?.message ||
+            'Capsule generation failed'
+        });
+    }
+  }
+);
+
 
 /* ============================================================
    ROOT INFO
 ============================================================ */
 
-app.get('/', (_req, res) => {
-  res.status(200).json({
-    service: 'CorVital Plus Metafield Automation',
-    status: 'running',
-    health: '/health',
-    webhook: '/webhooks/products'
-  });
-});
+app.get(
+  '/',
+
+  (_req, res) => {
+    res
+      .status(200)
+      .json({
+        service:
+          'CorVital Plus Metafield Automation',
+
+        status:
+          'running',
+
+        health:
+          '/health',
+
+        webhook:
+          '/webhooks/products',
+
+        capsuleGenerator:
+          '/admin/generate-capsule/:productId'
+      });
+  }
+);
+
+
+/* ============================================================
+   404
+============================================================ */
+
+app.use(
+  (req, res) => {
+    res
+      .status(404)
+      .json({
+        error:
+          'Route not found',
+
+        path:
+          req.path
+      });
+  }
+);
+
 
 /* ============================================================
    START SERVER
 ============================================================ */
 
-app.listen(config.port, () => {
-  console.log(
-    `CorVital metafield automation listening on port ${config.port}`
-  );
+app.listen(
+  config.port,
 
-  console.log(
-    `Health: http://localhost:${config.port}/health`
-  );
+  () => {
+    console.log(
+      `CorVital metafield automation listening on port ${config.port}`
+    );
 
-  console.log(
-    'Webhook path: /webhooks/products'
-  );
-});
+    console.log(
+      `Health: http://localhost:${config.port}/health`
+    );
+
+    console.log(
+      'Webhook path: /webhooks/products'
+    );
+
+    console.log(
+      'Capsule generator path: /admin/generate-capsule/:productId'
+    );
+  }
+);

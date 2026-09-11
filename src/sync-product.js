@@ -1,5 +1,6 @@
 import { shopifyGraphQL } from './shopify.js';
 import { METAFIELD_TYPES, parseSuplifulDescription, toMetafieldValue } from './parser.js';
+import { generateCapsuleDraft } from './capsule-generator.js';
 
 const CAPSULE_SOURCE_KEY = 'capsule_source_candidate';
 const CAPSULE_SOURCE_TYPE = 'json';
@@ -303,4 +304,211 @@ export async function listAllProducts() {
   } while (after);
 
   return products;
+}
+
+export async function generateProductCapsuleDraft(
+  productGid
+) {
+
+  const query = `
+    query CapsuleProduct($id: ID!) {
+      product(id: $id) {
+        id
+        title
+
+        metafield(
+          namespace: "custom"
+          key: "capsule_source_candidate"
+        ) {
+          value
+        }
+      }
+    }
+  `;
+
+
+  const data =
+    await shopifyGraphQL(
+      query,
+      {
+        id:
+          productGid
+      }
+    );
+
+
+  const product =
+    data?.product;
+
+
+  if (!product) {
+    throw new Error(
+      `Product not found: ${productGid}`
+    );
+  }
+
+
+  const candidateRaw =
+    product
+      ?.metafield
+      ?.value;
+
+
+  if (!candidateRaw) {
+    throw new Error(
+      `No capsule_source_candidate found for ${product.title}`
+    );
+  }
+
+
+  let candidate;
+
+
+  try {
+    candidate =
+      JSON.parse(
+        candidateRaw
+      );
+  } catch {
+    throw new Error(
+      `Invalid capsule_source_candidate JSON for ${product.title}`
+    );
+  }
+
+
+  if (!candidate?.url) {
+    throw new Error(
+      `Capsule source candidate has no URL for ${product.title}`
+    );
+  }
+
+
+  console.log(
+    `[capsule-ai] Creating draft for ${product.title}`
+  );
+
+
+  /* ----------------------------------------------------------
+     Generate AI capsule
+  ---------------------------------------------------------- */
+
+  const generated =
+    await generateCapsuleDraft({
+      productId:
+        product.id,
+
+      productTitle:
+        product.title,
+
+      referenceImageUrl:
+        candidate.url
+    });
+
+
+  /* ----------------------------------------------------------
+     Save resulting URL to Shopify
+  ---------------------------------------------------------- */
+
+  const mutation = `
+    mutation SetCapsuleDraft(
+      $metafields: [MetafieldsSetInput!]!
+    ) {
+      metafieldsSet(
+        metafields: $metafields
+      ) {
+        metafields {
+          namespace
+          key
+          value
+        }
+
+        userErrors {
+          field
+          message
+          code
+        }
+      }
+    }
+  `;
+
+
+  const mutationData =
+    await shopifyGraphQL(
+      mutation,
+      {
+        metafields: [
+          {
+            ownerId:
+              product.id,
+
+            namespace:
+              'custom',
+
+            key:
+              'capsule_generated_draft',
+
+            type:
+              'url',
+
+            value:
+              generated.url
+          },
+
+          {
+            ownerId:
+              product.id,
+
+            namespace:
+              'custom',
+
+            key:
+              'capsule_visual_status',
+
+            type:
+              'single_line_text_field',
+
+            value:
+              'draft'
+          }
+        ]
+      }
+    );
+
+
+  const userErrors =
+    mutationData
+      ?.metafieldsSet
+      ?.userErrors || [];
+
+
+  if (userErrors.length) {
+    throw new Error(
+      userErrors
+        .map(
+          (error) =>
+            `${error.field || ''}: ${error.message}`
+        )
+        .join('; ')
+    );
+  }
+
+
+  console.log(
+    `[capsule-ai] ${product.title}: draft URL written to Shopify`
+  );
+
+
+  return {
+    product:
+      product.title,
+
+    status:
+      'draft',
+
+    image:
+      generated.url,
+
+    reference:
+      candidate.url
+  };
 }
