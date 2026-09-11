@@ -1,31 +1,14 @@
 import { GoogleGenAI } from '@google/genai';
 import { put } from '@vercel/blob';
 
-/* ============================================================
-   CORVITAL PLUS — CAPSULE AI GENERATOR
-   ------------------------------------------------------------
-   Input:
-   - Real Shopify/Supliful product image
-   - Product title
+const MODEL = process.env.GEMINI_IMAGE_MODEL || 'gemini-3.1-flash-image';
 
-   Output:
-   - AI-reconstructed capsule-only PNG
-   - Stored in Vercel Blob
-============================================================ */
-
-
-/* ============================================================
-   GEMINI CLIENT
-============================================================ */
-
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY
-});
-
-
-/* ============================================================
-   HELPERS
-============================================================ */
+function getGeminiClient() {
+  if (!process.env.GEMINI_API_KEY) {
+    throw new Error('GEMINI_API_KEY is missing.');
+  }
+  return new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+}
 
 function slugify(value) {
   return String(value || 'product')
@@ -35,428 +18,167 @@ function slugify(value) {
     .slice(0, 80);
 }
 
-
 function detectMimeType(contentType, imageUrl) {
-  const type =
-    String(contentType || '')
-      .toLowerCase();
+  const type = String(contentType || '').toLowerCase();
+  if (type.includes('png')) return 'image/png';
+  if (type.includes('jpeg') || type.includes('jpg')) return 'image/jpeg';
+  if (type.includes('webp')) return 'image/webp';
 
-  if (type.includes('png')) {
-    return 'image/png';
-  }
-
-  if (
-    type.includes('jpeg') ||
-    type.includes('jpg')
-  ) {
-    return 'image/jpeg';
-  }
-
-  if (type.includes('webp')) {
-    return 'image/webp';
-  }
-
-
-  const url =
-    String(imageUrl || '')
-      .toLowerCase();
-
-
-  if (url.includes('.png')) {
-    return 'image/png';
-  }
-
-  if (
-    url.includes('.jpg') ||
-    url.includes('.jpeg')
-  ) {
-    return 'image/jpeg';
-  }
-
-  if (url.includes('.webp')) {
-    return 'image/webp';
-  }
-
-
+  const url = String(imageUrl || '').toLowerCase();
+  if (/\.png(?:\?|$)/.test(url)) return 'image/png';
+  if (/\.jpe?g(?:\?|$)/.test(url)) return 'image/jpeg';
+  if (/\.webp(?:\?|$)/.test(url)) return 'image/webp';
   return 'image/png';
 }
 
+async function downloadReferenceImage(imageUrl) {
+  if (!imageUrl) throw new Error('No reference image URL supplied.');
 
-/* ============================================================
-   DOWNLOAD REFERENCE IMAGE
-============================================================ */
-
-async function downloadReferenceImage(
-  imageUrl
-) {
-  if (!imageUrl) {
-    throw new Error(
-      'No reference image URL supplied.'
-    );
-  }
-
-
-  const response =
-    await fetch(imageUrl);
-
-
+  const response = await fetch(imageUrl);
   if (!response.ok) {
     throw new Error(
       `Unable to download reference image: ${response.status} ${response.statusText}`
     );
   }
 
-
-  const contentType =
-    response.headers.get(
-      'content-type'
-    );
-
-
-  const arrayBuffer =
-    await response.arrayBuffer();
-
-
-  const buffer =
-    Buffer.from(arrayBuffer);
-
-
-  if (!buffer.length) {
-    throw new Error(
-      'Reference image download returned an empty file.'
-    );
-  }
-
-
-  const mimeType =
-    detectMimeType(
-      contentType,
-      imageUrl
-    );
-
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (!buffer.length) throw new Error('Reference image download returned an empty file.');
 
   return {
     buffer,
-    mimeType
+    mimeType: detectMimeType(response.headers.get('content-type'), imageUrl),
   };
 }
 
-
-/* ============================================================
-   GENERATION PROMPT
-============================================================ */
-
 function buildPrompt(productTitle) {
   return `
-You are creating a product-detail visual asset for the supplement product "${productTitle}".
+Use the supplied product image as the ONLY visual reference for the physical capsule shown in the image.
 
-Use ONLY the capsules or tablets visible in the supplied reference photograph as the physical visual reference.
+Product: ${productTitle}
 
-Your task is to reconstruct a clean, high-resolution studio image of the SAME capsule appearance.
+Create a clean, premium studio product asset showing ONE opened capsule with a small natural amount of its internal powder spilling from the opening.
 
-STRICT REQUIREMENTS:
+ACCURACY REQUIREMENTS:
+- Match the real capsule shell color visible in the reference image as closely as possible.
+- Match its shell opacity/transparency.
+- Match its capsule shape and proportions.
+- Match the visible powder/fill color.
+- Preserve the real capsule's overall physical appearance.
+- Do not invent a different capsule color or design.
 
-1. Match the visible capsule shell color as closely as possible.
-2. Match the shell opacity or transparency.
-3. Match the capsule shape and proportions.
-4. Match the visible fill/powder color.
-5. Preserve the general physical appearance of the actual capsule shown in the reference.
-6. Ignore the product bottle.
-7. Ignore all packaging.
-8. Ignore all text.
-9. Ignore all icons.
-10. Ignore instructions or graphic design elements in the source image.
-11. Do not reproduce the product label.
-12. Do not add branding.
-13. Do not add words.
-14. Do not add ingredient names.
-15. Do not add connector lines.
-16. Do not add decorative props.
+REMOVE / IGNORE:
+- bottle
+- product label
+- packaging
+- logos
+- text
+- icons
+- instructions
+- hands or people
+- decorative props
+- infographic elements
 
-COMPOSITION:
+OUTPUT COMPOSITION:
+- one opened capsule as the clear central subject
+- small realistic powder spill
+- premium supplement studio photography
+- centered composition
+- soft realistic lighting
+- clean neutral white or near-white background
+- no text or branding anywhere
 
-- Show one opened capsule as the main subject.
-- Include a small realistic amount of powder spilling from the opening.
-- Premium supplement product photography.
-- Soft studio lighting.
-- Sharp, realistic capsule edges.
-- Centered composition.
-- Minimal neutral background.
-- No bottle.
-- No text.
-- No logo.
-- No people.
-
-This image will later be placed inside a separate HTML ingredient infographic, so the output should contain ONLY the reconstructed capsule and powder.
-
-Do not invent a different capsule design.
+This image will later be placed into a separate HTML ingredient infographic. Generate only the capsule visual and powder.
 `.trim();
 }
 
-
-/* ============================================================
-   EXTRACT GENERATED IMAGE FROM GEMINI RESPONSE
-============================================================ */
-
-function extractGeneratedImage(
-  interaction
-) {
-  /*
-    The current Gemini Interactions API exposes
-    the final generated image as output_image.
-  */
-
-  if (
-    interaction?.output_image?.data
-  ) {
+function getOutputImage(interaction) {
+  if (interaction?.output_image?.data) {
     return {
-      data:
-        interaction.output_image.data,
-
-      mimeType:
-        interaction.output_image.mime_type ||
-        'image/png'
+      data: interaction.output_image.data,
+      mimeType: interaction.output_image.mime_type || 'image/png',
     };
   }
 
-
-  /*
-    Defensive fallback:
-    inspect model-output steps.
-  */
-
-  const steps =
-    interaction?.steps || [];
-
-
-  for (const step of steps) {
-    if (
-      step?.type !==
-      'model_output'
-    ) {
-      continue;
-    }
-
-
-    for (
-      const block of
-      step.content || []
-    ) {
-      if (
-        block?.type === 'image' &&
-        block?.data
-      ) {
+  for (const step of interaction?.steps || []) {
+    if (step?.type !== 'model_output') continue;
+    for (const block of step?.content || []) {
+      if (block?.type === 'image' && block?.data) {
         return {
-          data:
-            block.data,
-
-          mimeType:
-            block.mime_type ||
-            'image/png'
+          data: block.data,
+          mimeType: block.mime_type || 'image/png',
         };
       }
     }
   }
 
-
   return null;
 }
-
-
-/* ============================================================
-   MAIN GENERATOR
-============================================================ */
 
 export async function generateCapsuleDraft({
   productId,
   productTitle,
-  referenceImageUrl
+  referenceImageUrl,
 }) {
-
-  /* ----------------------------------------------------------
-     Environment checks
-  ---------------------------------------------------------- */
-
-  if (
-    !process.env.GEMINI_API_KEY
-  ) {
-    throw new Error(
-      'GEMINI_API_KEY is missing.'
-    );
-  }
-
-
   if (!referenceImageUrl) {
-    throw new Error(
-      `No capsule reference image available for ${productTitle}.`
-    );
+    throw new Error(`No capsule reference image available for ${productTitle}.`);
   }
 
+  console.log(`[capsule-ai] Starting generation for ${productTitle}`);
+  console.log(`[capsule-ai] Reference image: ${referenceImageUrl}`);
 
+  const reference = await downloadReferenceImage(referenceImageUrl);
   console.log(
-    `[capsule-ai] Starting generation for ${productTitle}`
+    `[capsule-ai] Reference downloaded: ${Math.round(reference.buffer.length / 1024)} KB (${reference.mimeType})`
   );
 
-
-  console.log(
-    `[capsule-ai] Reference image: ${referenceImageUrl}`
-  );
-
-
-  /* ----------------------------------------------------------
-     Download original Shopify image
-  ---------------------------------------------------------- */
-
-  const reference =
-    await downloadReferenceImage(
-      referenceImageUrl
-    );
-
-
-  console.log(
-    `[capsule-ai] Reference downloaded: ${Math.round(reference.buffer.length / 1024)} KB`
-  );
-
-
-  /* ----------------------------------------------------------
-     Convert to Base64 for Gemini
-  ---------------------------------------------------------- */
-
-  const base64Reference =
-    reference.buffer.toString(
-      'base64'
-    );
-
-
-  /* ----------------------------------------------------------
-     Gemini image edit/generation
-  ---------------------------------------------------------- */
-
-  const interaction =
-    await ai.interactions.create({
-      model:
-        'gemini-3.1-flash-image',
-
-      input: [
-        {
-          type: 'image',
-
-          mime_type:
-            reference.mimeType,
-
-          data:
-            base64Reference
-        },
-
-        {
-          type: 'text',
-
-          text:
-            buildPrompt(
-              productTitle
-            )
-        }
-      ],
-
-      response_format: {
+  const ai = getGeminiClient();
+  const interaction = await ai.interactions.create({
+    model: MODEL,
+    input: [
+      {
         type: 'image',
+        mime_type: reference.mimeType,
+        data: reference.buffer.toString('base64'),
+      },
+      {
+        type: 'text',
+        text: buildPrompt(productTitle),
+      },
+    ],
+  });
 
-        aspect_ratio: '1:1',
-
-        image_size: '2K'
-      }
-    });
-
-
-  /* ----------------------------------------------------------
-     Extract image
-  ---------------------------------------------------------- */
-
-  const generated =
-    extractGeneratedImage(
-      interaction
-    );
-
-
+  const generated = getOutputImage(interaction);
   if (!generated?.data) {
-    throw new Error(
-      'Gemini returned no generated image.'
-    );
+    throw new Error('Gemini returned no generated image.');
   }
 
-
-  const generatedBuffer =
-    Buffer.from(
-      generated.data,
-      'base64'
-    );
-
-
+  const generatedBuffer = Buffer.from(generated.data, 'base64');
   if (!generatedBuffer.length) {
-    throw new Error(
-      'Gemini generated image was empty.'
-    );
+    throw new Error('Gemini returned an empty generated image.');
   }
-
 
   console.log(
     `[capsule-ai] Generated image: ${Math.round(generatedBuffer.length / 1024)} KB`
   );
 
+  const numericProductId = String(productId || '').split('/').pop();
+  const fileName = `capsule-drafts/${slugify(productTitle)}-${numericProductId}-${Date.now()}.png`;
 
-  /* ----------------------------------------------------------
-     Store in Vercel Blob
-  ---------------------------------------------------------- */
+  // On new Vercel Blob project connections, the latest @vercel/blob can
+  // authenticate automatically through Vercel OIDC.
+  const blob = await put(fileName, generatedBuffer, {
+    access: 'public',
+    contentType: generated.mimeType || 'image/png',
+    addRandomSuffix: false,
+  });
 
-  const productSlug =
-    slugify(productTitle);
-
-
-  const numericProductId =
-    String(productId || '')
-      .split('/')
-      .pop();
-
-
-  const fileName =
-    `capsule-drafts/${productSlug}-${numericProductId}-${Date.now()}.png`;
-
-
-  const blob =
-    await put(
-      fileName,
-      generatedBuffer,
-      {
-        access: 'public',
-
-        contentType:
-          generated.mimeType ||
-          'image/png',
-
-        addRandomSuffix:
-          false
-      }
-    );
-
-
-  console.log(
-    `[capsule-ai] Stored draft: ${blob.url}`
-  );
-
+  console.log(`[capsule-ai] Stored draft: ${blob.url}`);
 
   return {
-    url:
-      blob.url,
-
-    pathname:
-      blob.pathname,
-
+    url: blob.url,
+    pathname: blob.pathname,
     referenceImageUrl,
-
-    generatedAt:
-      new Date().toISOString(),
-
-    model:
-      'gemini-3.1-flash-image'
+    generatedAt: new Date().toISOString(),
+    model: MODEL,
   };
 }
