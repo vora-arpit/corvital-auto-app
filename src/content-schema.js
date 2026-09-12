@@ -10,7 +10,7 @@ export const GENERATED_METAFIELD_TYPES = {
 
 export const EMPTY_CONTENT = {
   product_summary: null,
-  ingredient_story: null,
+  ingredient_story: [],
   formula_highlights: [],
   usage_display: null,
   compliance: {

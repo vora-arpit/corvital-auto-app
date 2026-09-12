@@ -1,7 +1,10 @@
 import { shopifyGraphQL } from './shopify.js';
 import { buildApprovedSource, sourceFingerprint } from './source-builder.js';
 import { generateGroundedContent } from './claude-content.js';
-import { validateGeneratedContent } from './compliance-validator.js';
+import {
+  validateGeneratedContent,
+  stripReviewClaims,
+} from './compliance-validator.js';
 import { GENERATED_METAFIELD_TYPES } from './content-schema.js';
 
 const CONTENT_PRODUCT_QUERY = `#graphql
@@ -35,15 +38,22 @@ function serialize(value) {
 }
 
 async function writeGeneratedMetafields(productId, content, validation, hash) {
-  const status = validation.passed ? 'approved' : 'needs_review';
+  const publishableContent = stripReviewClaims(content, validation);
 
-  // Never write editorial content when validation fails.
-  const fields = validation.passed
+  const status = !validation.safe_to_write
+    ? 'needs_review'
+    : validation.requires_review
+      ? 'approved_facts_claims_held'
+      : 'approved';
+
+  // Hard validation problems: do not write generated presentation content.
+  // We still write the review/status/hash so the issue is visible internally.
+  const fields = validation.safe_to_write
     ? {
-        product_summary: content.product_summary,
-        ingredient_story: content.ingredient_story,
-        formula_highlights: content.formula_highlights || [],
-        usage_display: content.usage_display,
+        product_summary: publishableContent.product_summary,
+        ingredient_story: publishableContent.ingredient_story || [],
+        formula_highlights: publishableContent.formula_highlights || [],
+        usage_display: publishableContent.usage_display,
         content_status: status,
         content_review: validation,
         content_source_hash: hash,
@@ -88,6 +98,9 @@ export async function generateProductContent(productGid, { write = false } = {})
   const hash = sourceFingerprint(approvedSource);
   const generated = await generateGroundedContent(approvedSource);
   const validation = validateGeneratedContent(generated.content, approvedSource);
+  const publishablePreview = validation.safe_to_write
+    ? stripReviewClaims(generated.content, validation)
+    : null;
 
   let written = [];
   if (write) {
@@ -100,7 +113,7 @@ export async function generateProductContent(productGid, { write = false } = {})
   }
 
   return {
-    stage: write ? '4B-write-enabled' : '4A-preview-only',
+    stage: write ? '4B-write-enabled-strict' : '4A-preview-strict',
     writes_to_shopify: Boolean(write),
     product: approvedSource.product,
     source_hash: hash,
@@ -109,6 +122,7 @@ export async function generateProductContent(productGid, { write = false } = {})
     usage: generated.usage,
     generated: generated.content,
     validation,
+    publishable_preview: publishablePreview,
     written_metafields: written.map((item) => item.key),
   };
 }

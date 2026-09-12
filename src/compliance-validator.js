@@ -1,8 +1,9 @@
-const HIGH_RISK_PATTERNS = [
+const HARD_BLOCK_PATTERNS = [
   /\bdiagnos(?:e|es|ed|ing|is)\b/i,
   /\btreat(?:s|ed|ing|ment)?\b/i,
   /\bcure(?:s|d|ing)?\b/i,
   /\bprevent(?:s|ed|ing|ion)?\b/i,
+  /\bmitigat(?:e|es|ed|ing|ion)\b/i,
   /\breverse(?:s|d|ing)?\b/i,
   /\bheal(?:s|ed|ing)?\b/i,
   /\bdisease\b/i,
@@ -10,7 +11,45 @@ const HIGH_RISK_PATTERNS = [
   /\bdiabetes\b/i,
   /\bfatty liver\b/i,
   /\bhigh blood pressure\b/i,
+  /\bhypertension\b/i,
 ];
+
+// These are not automatically prohibited. They are signals that the statement
+// is a health/wellness claim and therefore should not be auto-published as a fact.
+const REVIEW_CLAIM_PATTERNS = [
+  /\bsupport(?:s|ed|ing)?\b/i,
+  /\bmaintain(?:s|ed|ing)?\b/i,
+  /\bpromot(?:e|es|ed|ing)\b/i,
+  /\bhelp(?:s|ed|ing)?\b/i,
+  /\bfunction\b/i,
+  /\bresponse\b/i,
+  /\bwellness\b/i,
+  /\bwell[- ]?being\b/i,
+  /\bvitality\b/i,
+  /\benergy\b/i,
+  /\bmetabolic\b/i,
+  /\bmetabolism\b/i,
+  /\bcognitive\b/i,
+  /\bcardiovascular\b/i,
+  /\bimmune\b/i,
+  /\brepair\b/i,
+  /\bantioxidant\b/i,
+  /\binflammat(?:ion|ory)\b/i,
+  /\bdigest(?:ion|ive)\b/i,
+  /\bsleep\b/i,
+  /\bstress\b/i,
+  /\bmood\b/i,
+  /\bperformance\b/i,
+  /\bhealth\b/i,
+];
+
+const VALID_CLAIM_TYPES = new Set([
+  'fact',
+  'structure_function_claim',
+  'general_wellbeing_claim',
+  'disease_claim',
+  'other_claim',
+]);
 
 function normalize(value) {
   return String(value ?? '')
@@ -41,8 +80,17 @@ function claimEntries(content) {
   };
 
   pushClaim('product_summary', content?.product_summary);
-  pushClaim('ingredient_story.what_it_is', content?.ingredient_story?.what_it_is);
-  pushClaim('ingredient_story.why_in_formula', content?.ingredient_story?.why_in_formula);
+
+  const stories = Array.isArray(content?.ingredient_story)
+    ? content.ingredient_story
+    : content?.ingredient_story
+      ? [content.ingredient_story]
+      : [];
+
+  stories.forEach((story, index) => {
+    pushClaim(`ingredient_story[${index}].what_it_is`, story?.what_it_is);
+    pushClaim(`ingredient_story[${index}].why_in_formula`, story?.why_in_formula);
+  });
 
   (content?.formula_highlights || []).forEach((item, index) => {
     pushClaim(`formula_highlights[${index}]`, item);
@@ -51,28 +99,67 @@ function claimEntries(content) {
   return entries;
 }
 
+function addIssue(target, issue) {
+  target.push(issue);
+}
+
+function containsAny(text, patterns) {
+  return patterns.some((pattern) => pattern.test(text));
+}
+
+function validateIngredientFacts(content, approvedSource, hardIssues) {
+  const sourceText = normalize(flattenSource(approvedSource?.sources?.ingredients));
+  if (!sourceText) return;
+
+  const stories = Array.isArray(content?.ingredient_story)
+    ? content.ingredient_story
+    : content?.ingredient_story
+      ? [content.ingredient_story]
+      : [];
+
+  stories.forEach((story, index) => {
+    const name = String(story?.name || '').trim();
+    const amount = String(story?.amount || '').trim();
+
+    if (name && !sourceText.includes(normalize(name))) {
+      addIssue(hardIssues, {
+        code: 'INGREDIENT_NAME_NOT_FOUND_IN_SOURCE',
+        location: `ingredient_story[${index}].name`,
+        value: name,
+      });
+    }
+
+    if (amount && !sourceText.includes(normalize(amount))) {
+      addIssue(hardIssues, {
+        code: 'INGREDIENT_AMOUNT_NOT_FOUND_IN_SOURCE',
+        location: `ingredient_story[${index}].amount`,
+        value: amount,
+      });
+    }
+  });
+}
+
 export function validateGeneratedContent(content, approvedSource) {
-  const issues = [];
+  const hardIssues = [];
+  const reviewIssues = [];
   const sources = approvedSource?.sources || {};
 
   for (const claim of claimEntries(content)) {
     const text = String(claim.text || '').trim();
     const sourceField = String(claim.source_field || '').trim();
     const sourceQuote = String(claim.source_quote || '').trim();
+    const claimType = String(claim.claim_type || '').trim();
 
-    for (const pattern of HIGH_RISK_PATTERNS) {
-      if (pattern.test(text)) {
-        issues.push({
-          code: 'HIGH_RISK_LANGUAGE',
-          location: claim.location,
-          text,
-        });
-        break;
-      }
+    if (!VALID_CLAIM_TYPES.has(claimType)) {
+      addIssue(hardIssues, {
+        code: 'MISSING_OR_INVALID_CLAIM_TYPE',
+        location: claim.location,
+        claim_type: claimType || null,
+      });
     }
 
     if (!sourceField || !(sourceField in sources)) {
-      issues.push({
+      addIssue(hardIssues, {
         code: 'MISSING_OR_INVALID_SOURCE_FIELD',
         location: claim.location,
         source_field: sourceField || null,
@@ -81,7 +168,7 @@ export function validateGeneratedContent(content, approvedSource) {
     }
 
     if (!sourceQuote) {
-      issues.push({
+      addIssue(hardIssues, {
         code: 'MISSING_SOURCE_QUOTE',
         location: claim.location,
       });
@@ -92,14 +179,38 @@ export function validateGeneratedContent(content, approvedSource) {
     const quoteText = normalize(sourceQuote);
 
     if (!sourceText.includes(quoteText)) {
-      issues.push({
+      addIssue(hardIssues, {
         code: 'SOURCE_QUOTE_NOT_FOUND',
         location: claim.location,
         source_field: sourceField,
         source_quote: sourceQuote,
       });
     }
+
+    if (containsAny(text, HARD_BLOCK_PATTERNS) || claimType === 'disease_claim') {
+      addIssue(hardIssues, {
+        code: 'DISEASE_OR_HIGH_RISK_CLAIM',
+        location: claim.location,
+        text,
+        claim_type: claimType || null,
+      });
+      continue;
+    }
+
+    const looksLikeHealthClaim = containsAny(text, REVIEW_CLAIM_PATTERNS);
+
+    if (claimType !== 'fact' || looksLikeHealthClaim) {
+      addIssue(reviewIssues, {
+        code: 'CLAIM_REQUIRES_REVIEW',
+        location: claim.location,
+        text,
+        claim_type: claimType || (looksLikeHealthClaim ? 'unclassified_health_claim' : null),
+        source_field: sourceField,
+      });
+    }
   }
+
+  validateIngredientFacts(content, approvedSource, hardIssues);
 
   // Usage fields must be exact copies of approved source values.
   const usage = content?.usage_display || null;
@@ -113,9 +224,19 @@ export function validateGeneratedContent(content, approvedSource) {
     for (const [outputKey, sourceKey] of exactPairs) {
       const outputValue = usage[outputKey];
       if (outputValue === null || outputValue === undefined || outputValue === '') continue;
+
       const sourceValue = sources[sourceKey];
+      if (sourceValue === null || sourceValue === undefined || sourceValue === '') {
+        addIssue(hardIssues, {
+          code: 'USAGE_SOURCE_MISSING',
+          location: `usage_display.${outputKey}`,
+          source_field: sourceKey,
+        });
+        continue;
+      }
+
       if (normalize(outputValue) !== normalize(sourceValue)) {
-        issues.push({
+        addIssue(hardIssues, {
           code: 'USAGE_NOT_EXACT_SOURCE_COPY',
           location: `usage_display.${outputKey}`,
           source_field: sourceKey,
@@ -125,8 +246,45 @@ export function validateGeneratedContent(content, approvedSource) {
   }
 
   return {
-    passed: issues.length === 0,
-    requires_review: issues.length > 0,
-    issues,
+    passed: hardIssues.length === 0,
+    safe_to_write: hardIssues.length === 0,
+    requires_review: reviewIssues.length > 0 || hardIssues.length > 0,
+    hard_issues: hardIssues,
+    review_issues: reviewIssues,
+    issues: [...hardIssues, ...reviewIssues],
   };
+}
+
+export function stripReviewClaims(content, validation) {
+  const reviewLocations = new Set(
+    (validation?.review_issues || []).map((issue) => issue.location)
+  );
+
+  const result = JSON.parse(JSON.stringify(content || {}));
+
+  if (reviewLocations.has('product_summary')) {
+    result.product_summary = null;
+  }
+
+  const stories = Array.isArray(result.ingredient_story)
+    ? result.ingredient_story
+    : result.ingredient_story
+      ? [result.ingredient_story]
+      : [];
+
+  stories.forEach((story, index) => {
+    if (reviewLocations.has(`ingredient_story[${index}].what_it_is`)) {
+      story.what_it_is = null;
+    }
+    if (reviewLocations.has(`ingredient_story[${index}].why_in_formula`)) {
+      story.why_in_formula = null;
+    }
+  });
+  result.ingredient_story = stories;
+
+  result.formula_highlights = (result.formula_highlights || []).filter(
+    (_item, index) => !reviewLocations.has(`formula_highlights[${index}]`)
+  );
+
+  return result;
 }
