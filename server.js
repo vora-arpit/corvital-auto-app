@@ -6,7 +6,7 @@ import { syncProduct, listAllProducts } from './src/sync-product.js';
 import { generateProductContent } from './src/product-content.js';
 
 const app = express();
-const APP_VERSION = 'stage4f-bulk-generator-2026-09-12';
+const APP_VERSION = 'stage4g-structured-bulk-2026-09-12';
 const seenWebhookIds = new Map();
 
 function verifyWithSecret(rawBody, receivedHmac, secret) {
@@ -215,6 +215,11 @@ app.post('/admin/generate-all-products', async (req, res) => {
         row.safe_to_write = generated.validation?.safe_to_write_publishable_preview === true;
         row.source_hash = generated.source_hash;
         row.model = generated.model;
+        row.generation_attempts = generated.generation_attempts || 1;
+        row.response_mode = generated.response_mode || 'unknown';
+        row.hard_issues = generated.validation?.hard_issues || [];
+        row.review_issues = generated.validation?.review_issues || [];
+        row.validation_issues = generated.validation?.issues || [];
         row.written_metafields = generated.written_metafields || [];
 
         successful += 1;
@@ -235,7 +240,7 @@ app.post('/admin/generate-all-products', async (req, res) => {
     }
 
     return res.status(200).json({
-      stage: write ? '4F-bulk-write' : '4F-bulk-preview',
+      stage: write ? '4G-bulk-write-structured' : '4G-bulk-preview-structured',
       writes_to_shopify: write,
       sync_sources: syncSources,
       delay_ms: delayMs,

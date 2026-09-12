@@ -29,7 +29,7 @@ STRICT GROUNDING RULES
 9. Never invent timelines, studies, percentages, certifications, dosage, safety claims, or results.
 10. If a requested field is unsupported, return null or [].
 11. Do NOT add an asterisk to any claim. The application adds the asterisk deterministically after validation.
-12. Return JSON only. No markdown or commentary.
+12. Use the emit_product_content tool exactly once with the final structured result. Do not answer with prose.
 
 CLAIM TYPES
 Use exactly one:
@@ -44,81 +44,153 @@ Every text object must contain:
 - source_field: for facts, the exact FACTS key; for source claims, "description_clean"; for approved claims, "approved_claims"
 - source_quote: an exact contiguous quote from the applicable source.
 
-OUTPUT SHAPE
-{
-  "product_summary": null OR {
-    "text": "...",
-    "claim_type": "fact|source_claim|approved_claim|disease_claim",
-    "source_type": "fact|source_claim|approved_claim",
-    "source_field": "...",
-    "source_quote": "exact quote"
-  },
-  "ingredient_story": [
-    {
-      "name": "exact ingredient name from FACTS",
-      "amount": null OR "exact amount from FACTS",
-      "what_it_is": null OR {
-        "text": "factual identity only",
-        "claim_type": "fact",
-        "source_type": "fact",
-        "source_field": "ingredients|ingredient_highlights",
-        "source_quote": "exact quote where practical"
-      },
-      "why_in_formula": null OR {
-        "text": "exact source-backed claim",
-        "claim_type": "source_claim|approved_claim",
-        "source_type": "source_claim|approved_claim",
-        "source_field": "description_clean|approved_claims",
-        "source_quote": "exact claim"
-      }
-    }
-  ],
-  "formula_highlights": [
-    {
-      "title": "exact ingredient name",
-      "amount": null OR "exact amount",
-      "text": "factual identity OR exact source-backed claim",
-      "claim_type": "fact|source_claim|approved_claim",
-      "source_type": "fact|source_claim|approved_claim",
-      "source_field": "...",
-      "source_quote": "exact quote"
-    }
-  ],
-  "usage_display": null OR {
-    "serving_size": null OR "exact FACTS value",
-    "servings_per_container": null OR "exact FACTS value",
-    "suggested_use": null OR "exact FACTS value"
-  },
-  "compliance": {
-    "requires_review": false,
-    "issues": []
-  }
-}
-
 PREFERENCE
 Use useful source-backed "supports", "helps maintain", "promotes", and similar structure/function/general-wellness wording when it is present in SOURCE_CLAIM_TEXT. Do not omit such claims merely because APPROVED_CLAIMS is empty.
 `.trim();
 
-function parseClaudeJson(message) {
-  const text = (message?.content || [])
-    .filter((block) => block.type === 'text')
-    .map((block) => block.text)
-    .join('\n')
-    .trim();
+const textObjectSchema = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    text: { type: 'string' },
+    claim_type: {
+      type: 'string',
+      enum: ['fact', 'source_claim', 'approved_claim', 'disease_claim'],
+    },
+    source_type: {
+      type: 'string',
+      enum: ['fact', 'source_claim', 'approved_claim'],
+    },
+    source_field: { type: 'string' },
+    source_quote: { type: 'string' },
+  },
+  required: ['text', 'claim_type', 'source_type', 'source_field', 'source_quote'],
+};
 
-  if (!text) throw new Error('Claude returned an empty response.');
+const nullableTextObjectSchema = {
+  anyOf: [textObjectSchema, { type: 'null' }],
+};
 
-  const cleaned = text
-    .replace(/^```json\s*/i, '')
-    .replace(/^```\s*/i, '')
-    .replace(/\s*```$/i, '')
-    .trim();
+const OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    product_summary: nullableTextObjectSchema,
+    ingredient_story: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          name: { type: 'string' },
+          amount: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+          what_it_is: nullableTextObjectSchema,
+          why_in_formula: nullableTextObjectSchema,
+        },
+        required: ['name', 'amount', 'what_it_is', 'why_in_formula'],
+      },
+    },
+    formula_highlights: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          title: { type: 'string' },
+          amount: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+          text: { type: 'string' },
+          claim_type: {
+            type: 'string',
+            enum: ['fact', 'source_claim', 'approved_claim', 'disease_claim'],
+          },
+          source_type: {
+            type: 'string',
+            enum: ['fact', 'source_claim', 'approved_claim'],
+          },
+          source_field: { type: 'string' },
+          source_quote: { type: 'string' },
+        },
+        required: [
+          'title',
+          'amount',
+          'text',
+          'claim_type',
+          'source_type',
+          'source_field',
+          'source_quote',
+        ],
+      },
+    },
+    usage_display: {
+      anyOf: [
+        {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            serving_size: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+            servings_per_container: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+            suggested_use: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+          },
+          required: ['serving_size', 'servings_per_container', 'suggested_use'],
+        },
+        { type: 'null' },
+      ],
+    },
+    compliance: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        requires_review: { type: 'boolean' },
+        issues: {
+          type: 'array',
+          items: { type: 'string' },
+        },
+      },
+      required: ['requires_review', 'issues'],
+    },
+  },
+  required: [
+    'product_summary',
+    'ingredient_story',
+    'formula_highlights',
+    'usage_display',
+    'compliance',
+  ],
+};
 
-  try {
-    return JSON.parse(cleaned);
-  } catch (error) {
-    throw new Error(`Claude returned invalid JSON: ${error.message}`);
+const CONTENT_TOOL = {
+  name: 'emit_product_content',
+  description: 'Return the final source-grounded product content in the required schema.',
+  input_schema: OUTPUT_SCHEMA,
+};
+
+function extractToolInput(message) {
+  const toolBlock = (message?.content || []).find(
+    (block) => block.type === 'tool_use' && block.name === CONTENT_TOOL.name
+  );
+
+  if (!toolBlock || !toolBlock.input || typeof toolBlock.input !== 'object') {
+    throw new Error('Claude did not return the required structured product-content tool output.');
   }
+
+  return toolBlock.input;
+}
+
+async function requestStructuredContent(client, modelInput) {
+  return client.messages.create({
+    model: config.claudeModel,
+    max_tokens: 3200,
+    temperature: 0,
+    system: SYSTEM_PROMPT,
+    tools: [CONTENT_TOOL],
+    tool_choice: { type: 'tool', name: CONTENT_TOOL.name },
+    messages: [
+      {
+        role: 'user',
+        content: `PRODUCT_SOURCE:\n${JSON.stringify(modelInput, null, 2)}`,
+      },
+    ],
+  });
 }
 
 export async function generateGroundedContent(approvedSource) {
@@ -132,22 +204,30 @@ export async function generateGroundedContent(approvedSource) {
     raw_sources: approvedSource.raw_sources,
   };
 
-  const message = await client.messages.create({
-    model: config.claudeModel,
-    max_tokens: 1800,
-    temperature: 0,
-    system: SYSTEM_PROMPT,
-    messages: [
-      {
-        role: 'user',
-        content: `PRODUCT_SOURCE:\n${JSON.stringify(modelInput, null, 2)}`,
-      },
-    ],
-  });
+  let lastError = null;
 
-  return {
-    model: config.claudeModel,
-    usage: message.usage || null,
-    content: parseClaudeJson(message),
-  };
+  // One retry protects bulk runs from an occasional malformed/no-tool response
+  // without multiplying Claude usage excessively.
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const message = await requestStructuredContent(client, modelInput);
+      const content = extractToolInput(message);
+
+      return {
+        model: config.claudeModel,
+        usage: message.usage || null,
+        content,
+        attempts: attempt,
+        response_mode: 'forced_tool_schema',
+      };
+    } catch (error) {
+      lastError = error;
+      if (attempt === 2) break;
+      await new Promise((resolve) => setTimeout(resolve, 750));
+    }
+  }
+
+  throw new Error(
+    `Claude structured output failed after 2 attempts: ${lastError?.message || String(lastError)}`
+  );
 }

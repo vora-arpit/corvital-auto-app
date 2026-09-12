@@ -112,7 +112,7 @@ export async function generateProductContent(productGid, { write = false } = {})
   }
 
   return {
-    stage: write ? '4E-write-source-claims-starred' : '4E-preview-source-claims-starred',
+    stage: write ? '4G-write-structured-output' : '4G-preview-structured-output',
     writes_to_shopify: Boolean(write),
     product: approvedSource.product,
     source_hash: hash,
@@ -122,6 +122,8 @@ export async function generateProductContent(productGid, { write = false } = {})
     serving_derivation: approvedSource.facts?.serving_derivation || null,
     model: generated.model,
     usage: generated.usage,
+    generation_attempts: generated.attempts || 1,
+    response_mode: generated.response_mode || 'unknown',
     generated: generated.content,
     validation,
     publishable_preview: publishablePreview,
