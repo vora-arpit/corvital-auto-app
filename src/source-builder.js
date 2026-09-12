@@ -84,8 +84,8 @@ export function buildApprovedSource(product) {
     }
   }
 
-  // Runtime fallback so the content endpoint works even before a backfill has
-  // persisted the new derived serving metafields.
+  // Runtime fallback so content generation still has serving facts even if a
+  // backfill has not persisted the derived serving metafields yet.
   if (!rawSources.serving_size || !rawSources.servings_per_container) {
     const derived = deriveServingInfo({
       suggested_use: rawSources.suggested_use,
@@ -105,9 +105,6 @@ export function buildApprovedSource(product) {
 
   const approvedClaims = normalizeApprovedClaims(rawSources.approved_claims);
 
-  // Facts are the only auto-publishable knowledge Claude receives. The raw
-  // marketing description is intentionally excluded from facts because it may
-  // contain structure/function claims that have not been explicitly approved.
   const facts = compactObject({
     ingredients: rawSources.ingredients,
     ingredient_highlights: rawSources.ingredient_highlights,
@@ -127,6 +124,13 @@ export function buildApprovedSource(product) {
     product_attributes: rawSources.product_attributes,
   });
 
+  // Source-backed structure/function and general-wellness claims may come from
+  // the manufacturer/Supliful marketing description. Claude may only reuse an
+  // exact contiguous quote from this text; it may not strengthen or invent it.
+  const sourceClaimText = typeof rawSources.description_clean === 'string'
+    ? rawSources.description_clean.trim()
+    : '';
+
   return {
     product: {
       id: product.id,
@@ -134,9 +138,8 @@ export function buildApprovedSource(product) {
       handle: product.handle,
     },
     facts,
+    source_claim_text: sourceClaimText || null,
     approved_claims: approvedClaims,
-    // Kept for internal audit/debugging only. Claude is instructed not to use
-    // raw marketing prose unless a claim has separately been approved.
     raw_sources: rawSources,
   };
 }
@@ -151,6 +154,7 @@ function stableStringify(value) {
 export function sourceFingerprint(approvedSource) {
   const canonical = stableStringify({
     facts: approvedSource.facts,
+    source_claim_text: approvedSource.source_claim_text,
     approved_claims: approvedSource.approved_claims,
   });
   return crypto.createHash('sha256').update(canonical).digest('hex');

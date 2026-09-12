@@ -3,7 +3,7 @@ import { buildApprovedSource, sourceFingerprint } from './source-builder.js';
 import { generateGroundedContent } from './claude-content.js';
 import {
   validateGeneratedContent,
-  stripReviewClaims,
+  buildPublishableContent,
 } from './compliance-validator.js';
 import { GENERATED_METAFIELD_TYPES } from './content-schema.js';
 
@@ -38,7 +38,7 @@ function serialize(value) {
 }
 
 async function writeGeneratedMetafields(productId, content, validation, hash) {
-  const publishableContent = stripReviewClaims(content, validation);
+  const publishableContent = buildPublishableContent(content, validation);
   const canWrite = Boolean(publishableContent) && validation.safe_to_write_publishable_preview === true;
 
   const status = !canWrite
@@ -98,7 +98,7 @@ export async function generateProductContent(productGid, { write = false } = {})
   const generated = await generateGroundedContent(approvedSource);
   const validation = validateGeneratedContent(generated.content, approvedSource);
   const publishablePreview = validation.safe_to_write_publishable_preview
-    ? stripReviewClaims(generated.content, validation)
+    ? buildPublishableContent(generated.content, validation)
     : null;
 
   let written = [];
@@ -112,11 +112,12 @@ export async function generateProductContent(productGid, { write = false } = {})
   }
 
   return {
-    stage: write ? '4D-write-facts-approved-claims' : '4D-preview-facts-approved-claims',
+    stage: write ? '4E-write-source-claims-starred' : '4E-preview-source-claims-starred',
     writes_to_shopify: Boolean(write),
     product: approvedSource.product,
     source_hash: hash,
     fact_fields: Object.keys(approvedSource.facts || {}),
+    has_source_claim_text: Boolean(approvedSource.source_claim_text),
     approved_claims_count: (approvedSource.approved_claims || []).length,
     serving_derivation: approvedSource.facts?.serving_derivation || null,
     model: generated.model,
@@ -124,6 +125,7 @@ export async function generateProductContent(productGid, { write = false } = {})
     generated: generated.content,
     validation,
     publishable_preview: publishablePreview,
+    disclaimer_strategy: 'Global footer disclaimer already present; app appends * to validated health/wellness claims only.',
     written_metafields: written.map((item) => item.key),
   };
 }

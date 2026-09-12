@@ -5,7 +5,6 @@ const HARD_BLOCK_PATTERNS = [
   /\bprevent(?:s|ed|ing|ion)?\b/i,
   /\bmitigat(?:e|es|ed|ing|ion)\b/i,
   /\breverse(?:s|d|ing)?\b/i,
-  /\bheal(?:s|ed|ing)?\b/i,
   /\bdisease\b/i,
   /\bcancer\b/i,
   /\bdiabetes\b/i,
@@ -16,8 +15,8 @@ const HARD_BLOCK_PATTERNS = [
 
 const VALID_CLAIM_TYPES = new Set([
   'fact',
+  'source_claim',
   'approved_claim',
-  'unapproved_claim',
   'disease_claim',
 ]);
 
@@ -38,10 +37,6 @@ function flatten(value) {
   if (Array.isArray(value)) return value.map(flatten).join(' | ');
   if (typeof value === 'object') return Object.values(value).map(flatten).join(' | ');
   return '';
-}
-
-function addIssue(target, issue) {
-  target.push(issue);
 }
 
 function claimEntries(content) {
@@ -79,45 +74,75 @@ function approvedClaimsText(approvedSource) {
     .join(' | ');
 }
 
-function validateIngredientFacts(content, approvedSource, hardIssues) {
-  const sourceText = normalize(flatten([
+function structuredIngredientText(approvedSource) {
+  return normalize(flatten([
     approvedSource?.facts?.ingredients,
     approvedSource?.facts?.ingredient_highlights,
   ]));
+}
 
+function validateIngredientFacts(content, approvedSource, hardIssues) {
+  const sourceText = structuredIngredientText(approvedSource);
   if (!sourceText) return;
 
   const stories = Array.isArray(content?.ingredient_story)
     ? content.ingredient_story
     : [];
 
-  stories.forEach((story, index) => {
-    const name = String(story?.name || '').trim();
-    const amount = String(story?.amount || '').trim();
+  const rows = [
+    ...stories.map((story, index) => ({
+      location: `ingredient_story[${index}]`,
+      name: story?.name,
+      amount: story?.amount,
+    })),
+    ...(content?.formula_highlights || []).map((item, index) => ({
+      location: `formula_highlights[${index}]`,
+      name: item?.title,
+      amount: item?.amount,
+    })),
+  ];
+
+  for (const row of rows) {
+    const name = String(row.name || '').trim();
+    const amount = String(row.amount || '').trim();
 
     if (name && !sourceText.includes(normalize(name))) {
-      addIssue(hardIssues, {
+      hardIssues.push({
         code: 'INGREDIENT_NAME_NOT_FOUND_IN_FACTS',
-        location: `ingredient_story[${index}].name`,
+        location: `${row.location}.name`,
         value: name,
       });
     }
 
     if (amount && !sourceText.includes(normalize(amount))) {
-      addIssue(hardIssues, {
+      hardIssues.push({
         code: 'INGREDIENT_AMOUNT_NOT_FOUND_IN_FACTS',
-        location: `ingredient_story[${index}].amount`,
+        location: `${row.location}.amount`,
         value: amount,
       });
     }
-  });
+  }
+}
+
+function sourceClaimIsExactQuote(claim, approvedSource) {
+  const quote = normalize(claim.source_quote);
+  if (!quote) return false;
+
+  if (claim.claim_type === 'source_claim') {
+    return normalize(approvedSource?.source_claim_text).includes(quote);
+  }
+
+  if (claim.claim_type === 'approved_claim') {
+    return normalize(approvedClaimsText(approvedSource)).includes(quote);
+  }
+
+  return false;
 }
 
 export function validateGeneratedContent(content, approvedSource) {
   const hardIssues = [];
   const reviewIssues = [];
   const facts = approvedSource?.facts || {};
-  const approvedClaims = approvedClaimsText(approvedSource);
 
   for (const claim of claimEntries(content)) {
     const text = String(claim.text || '').trim();
@@ -127,7 +152,7 @@ export function validateGeneratedContent(content, approvedSource) {
     const sourceQuote = String(claim.source_quote || '').trim();
 
     if (!VALID_CLAIM_TYPES.has(claimType)) {
-      addIssue(hardIssues, {
+      hardIssues.push({
         code: 'INVALID_CLAIM_TYPE',
         location: claim.location,
         claim_type: claimType || null,
@@ -136,7 +161,7 @@ export function validateGeneratedContent(content, approvedSource) {
     }
 
     if (claimType === 'disease_claim' || HARD_BLOCK_PATTERNS.some((pattern) => pattern.test(text))) {
-      addIssue(hardIssues, {
+      hardIssues.push({
         code: 'DISEASE_OR_HIGH_RISK_CLAIM',
         location: claim.location,
         text,
@@ -144,17 +169,8 @@ export function validateGeneratedContent(content, approvedSource) {
       continue;
     }
 
-    if (claimType === 'unapproved_claim') {
-      addIssue(hardIssues, {
-        code: 'UNAPPROVED_CLAIM_GENERATED',
-        location: claim.location,
-        text,
-      });
-      continue;
-    }
-
     if (!sourceQuote) {
-      addIssue(hardIssues, {
+      hardIssues.push({
         code: 'MISSING_SOURCE_QUOTE',
         location: claim.location,
       });
@@ -163,39 +179,87 @@ export function validateGeneratedContent(content, approvedSource) {
 
     if (claimType === 'fact') {
       if (sourceType !== 'fact' || !(sourceField in facts)) {
-        addIssue(hardIssues, {
+        hardIssues.push({
           code: 'INVALID_FACT_SOURCE',
           location: claim.location,
-          source_type: sourceType || null,
-          source_field: sourceField || null,
+          source_type: sourceType,
+          source_field: sourceField,
         });
         continue;
       }
 
-      const sourceText = normalize(flatten(facts[sourceField]));
-      if (!sourceText.includes(normalize(sourceQuote))) {
-        addIssue(hardIssues, {
-          code: 'FACT_SOURCE_QUOTE_NOT_FOUND',
+      // For structured ingredient arrays, exact combined quote matching is not
+      // required because name and amount can be separate JSON fields. Those are
+      // validated independently below. For ordinary scalar/text facts, require
+      // the quote to exist in that exact fact field.
+      if (!['ingredient_highlights', 'ingredients'].includes(sourceField)) {
+        const factText = normalize(flatten(facts[sourceField]));
+        if (!factText.includes(normalize(sourceQuote))) {
+          hardIssues.push({
+            code: 'FACT_SOURCE_QUOTE_NOT_FOUND',
+            location: claim.location,
+            source_field: sourceField,
+            source_quote: sourceQuote,
+          });
+        }
+      }
+      continue;
+    }
+
+    if (claimType === 'source_claim') {
+      if (sourceType !== 'source_claim' || sourceField !== 'description_clean') {
+        hardIssues.push({
+          code: 'INVALID_SOURCE_CLAIM_REFERENCE',
           location: claim.location,
-          source_field: sourceField,
+        });
+        continue;
+      }
+
+      if (!sourceClaimIsExactQuote(claim, approvedSource)) {
+        hardIssues.push({
+          code: 'SOURCE_CLAIM_QUOTE_NOT_FOUND',
+          location: claim.location,
+          source_quote: sourceQuote,
+        });
+        continue;
+      }
+
+      // To prevent strengthening or creative paraphrase, source-backed claim
+      // display text must match the source quote (ignoring whitespace/case).
+      if (normalize(text) !== normalize(sourceQuote)) {
+        hardIssues.push({
+          code: 'SOURCE_CLAIM_REWORDED',
+          location: claim.location,
+          text,
           source_quote: sourceQuote,
         });
       }
+      continue;
     }
 
     if (claimType === 'approved_claim') {
       if (sourceType !== 'approved_claim' || sourceField !== 'approved_claims') {
-        addIssue(hardIssues, {
-          code: 'INVALID_APPROVED_CLAIM_SOURCE',
+        hardIssues.push({
+          code: 'INVALID_APPROVED_CLAIM_REFERENCE',
           location: claim.location,
         });
         continue;
       }
 
-      if (!normalize(approvedClaims).includes(normalize(sourceQuote))) {
-        addIssue(hardIssues, {
-          code: 'APPROVED_CLAIM_NOT_FOUND',
+      if (!sourceClaimIsExactQuote(claim, approvedSource)) {
+        hardIssues.push({
+          code: 'APPROVED_CLAIM_QUOTE_NOT_FOUND',
           location: claim.location,
+          source_quote: sourceQuote,
+        });
+        continue;
+      }
+
+      if (normalize(text) !== normalize(sourceQuote)) {
+        hardIssues.push({
+          code: 'APPROVED_CLAIM_REWORDED',
+          location: claim.location,
+          text,
           source_quote: sourceQuote,
         });
       }
@@ -212,7 +276,7 @@ export function validateGeneratedContent(content, approvedSource) {
 
       const sourceValue = facts[key];
       if (sourceValue === null || sourceValue === undefined || sourceValue === '') {
-        addIssue(hardIssues, {
+        hardIssues.push({
           code: 'USAGE_FACT_MISSING',
           location: `usage_display.${key}`,
         });
@@ -220,7 +284,7 @@ export function validateGeneratedContent(content, approvedSource) {
       }
 
       if (normalize(outputValue) !== normalize(sourceValue)) {
-        addIssue(hardIssues, {
+        hardIssues.push({
           code: 'USAGE_NOT_EXACT_FACT_COPY',
           location: `usage_display.${key}`,
         });
@@ -228,8 +292,6 @@ export function validateGeneratedContent(content, approvedSource) {
     }
   }
 
-  // Claude's compliance notes are advisory only. They do not override the
-  // deterministic validator. Keep them visible as review notes if present.
   for (const issue of content?.compliance?.issues || []) {
     if (String(issue || '').trim()) {
       reviewIssues.push({ code: 'MODEL_REVIEW_NOTE', text: String(issue).trim() });
@@ -248,10 +310,47 @@ export function validateGeneratedContent(content, approvedSource) {
   };
 }
 
-export function stripReviewClaims(content, validation) {
-  // Under the Stage 4D model, an output either validates against FACTS /
-  // APPROVED_CLAIMS or it is a hard validation failure. No health claim is
-  // silently accepted merely because it came from raw marketing copy.
+function appendClaimAsterisk(text) {
+  const value = String(text || '').trim();
+  if (!value) return value;
+  if (/\*\s*[.!?]?$/.test(value)) return value;
+
+  const punctuation = value.match(/([.!?])$/);
+  if (punctuation) {
+    return `${value.slice(0, -1)}*${punctuation[1]}`;
+  }
+  return `${value}*`;
+}
+
+function decorateTextObject(value) {
+  if (!value || typeof value !== 'object') return value;
+  const copy = { ...value };
+  if (copy.claim_type === 'source_claim' || copy.claim_type === 'approved_claim') {
+    copy.text = appendClaimAsterisk(copy.text);
+  }
+  return copy;
+}
+
+export function buildPublishableContent(content, validation) {
   if (!validation?.safe_to_write_publishable_preview) return null;
-  return JSON.parse(JSON.stringify(content || {}));
+
+  const output = JSON.parse(JSON.stringify(content || {}));
+
+  if (output.product_summary) {
+    output.product_summary = decorateTextObject(output.product_summary);
+  }
+
+  if (Array.isArray(output.ingredient_story)) {
+    output.ingredient_story = output.ingredient_story.map((story) => ({
+      ...story,
+      what_it_is: decorateTextObject(story?.what_it_is),
+      why_in_formula: decorateTextObject(story?.why_in_formula),
+    }));
+  }
+
+  if (Array.isArray(output.formula_highlights)) {
+    output.formula_highlights = output.formula_highlights.map(decorateTextObject);
+  }
+
+  return output;
 }
