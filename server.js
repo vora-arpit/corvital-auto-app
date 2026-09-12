@@ -2,11 +2,11 @@ import crypto from 'node:crypto';
 import express from 'express';
 
 import { config } from './src/config.js';
-import { syncProduct } from './src/sync-product.js';
+import { syncProduct, listAllProducts } from './src/sync-product.js';
 import { generateProductContent } from './src/product-content.js';
 
 const app = express();
-const APP_VERSION = 'stage4b-claude-grounded-2026-09-11';
+const APP_VERSION = 'stage4f-bulk-generator-2026-09-12';
 const seenWebhookIds = new Map();
 
 function verifyWithSecret(rawBody, receivedHmac, secret) {
@@ -56,6 +56,7 @@ app.get('/', (_req, res) => {
     health: '/health',
     webhook: '/webhooks/products',
     contentGenerator: '/admin/generate-product-content/:productId',
+    bulkContentGenerator: '/admin/generate-all-products',
     routes: '/routes',
   });
 });
@@ -78,6 +79,7 @@ app.get('/routes', (_req, res) => {
       'GET /routes',
       'POST /webhooks/products',
       'POST /admin/generate-product-content/:productId',
+      'POST /admin/generate-all-products',
     ],
   });
 });
@@ -150,6 +152,108 @@ app.post('/admin/generate-product-content/:productId', async (req, res) => {
   }
 });
 
+
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+app.post('/admin/generate-all-products', async (req, res) => {
+  const suppliedSecret = req.get('X-Content-Generator-Secret');
+  const expectedSecret = process.env.CONTENT_GENERATOR_SECRET;
+
+  if (!secureStringEqual(suppliedSecret, expectedSecret)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  // Safe defaults:
+  // - preview only unless write === true
+  // - refresh source metafields before Claude unless sync_sources === false
+  // - wait 1.5 seconds between products to reduce rate-limit pressure
+  const write = req.body?.write === true;
+  const syncSources = req.body?.sync_sources !== false;
+  const requestedDelay = Number(req.body?.delay_ms ?? 1500);
+  const delayMs = Number.isFinite(requestedDelay)
+    ? Math.max(500, Math.min(10000, Math.round(requestedDelay)))
+    : 1500;
+
+  // Optional limit is useful for a small test run, e.g. {"write":false,"limit":2}
+  const requestedLimit = Number(req.body?.limit ?? 0);
+  const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+    ? Math.max(1, Math.min(100, Math.floor(requestedLimit)))
+    : 0;
+
+  try {
+    let products = await listAllProducts();
+    if (limit) products = products.slice(0, limit);
+
+    const results = [];
+    let successful = 0;
+    let failed = 0;
+    let written = 0;
+    let needsReview = 0;
+
+    for (let index = 0; index < products.length; index += 1) {
+      const product = products[index];
+      const row = {
+        index: index + 1,
+        id: product.id,
+        title: product.title,
+        handle: product.handle,
+        status: 'pending',
+      };
+
+      try {
+        if (syncSources) {
+          row.source_sync = await syncProduct(product.id);
+        }
+
+        const generated = await generateProductContent(product.id, { write });
+        row.status = write ? 'processed_and_written' : 'previewed';
+        row.validation_passed = generated.validation?.passed === true;
+        row.requires_review = generated.validation?.requires_review === true;
+        row.safe_to_write = generated.validation?.safe_to_write_publishable_preview === true;
+        row.source_hash = generated.source_hash;
+        row.model = generated.model;
+        row.written_metafields = generated.written_metafields || [];
+
+        successful += 1;
+        if (row.requires_review) needsReview += 1;
+        if (row.written_metafields.length) written += 1;
+      } catch (error) {
+        failed += 1;
+        row.status = 'failed';
+        row.error = error?.message || String(error);
+        console.error(`[bulk-content] Failed ${product.id} ${product.title}:`, error);
+      }
+
+      results.push(row);
+
+      if (index < products.length - 1 && delayMs > 0) {
+        await sleep(delayMs);
+      }
+    }
+
+    return res.status(200).json({
+      stage: write ? '4F-bulk-write' : '4F-bulk-preview',
+      writes_to_shopify: write,
+      sync_sources: syncSources,
+      delay_ms: delayMs,
+      total: products.length,
+      successful,
+      failed,
+      products_written: written,
+      needs_review: needsReview,
+      results,
+    });
+  } catch (error) {
+    console.error('[bulk-content] Bulk generation failed:', error);
+    return res.status(500).json({
+      error: error?.message || 'Bulk content generation failed',
+    });
+  }
+});
+
 app.use((req, res) => {
   res.status(404).json({ error: 'Route not found', method: req.method, path: req.path });
 });
@@ -158,4 +262,5 @@ app.listen(config.port, () => {
   console.log(`CorVital metafield automation ${APP_VERSION} listening on port ${config.port}`);
   console.log('Webhook path: /webhooks/products');
   console.log('Content generator: /admin/generate-product-content/:productId');
+  console.log('Bulk content generator: /admin/generate-all-products');
 });
