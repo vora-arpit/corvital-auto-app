@@ -6,7 +6,7 @@ import { syncProduct, listAllProducts } from './src/sync-product.js';
 import { generateProductContent } from './src/product-content.js';
 
 const app = express();
-const APP_VERSION = 'stage4g-structured-bulk-2026-09-12';
+const APP_VERSION = 'stage4i-manual-approval-2026-09-12';
 const seenWebhookIds = new Map();
 
 function verifyWithSecret(rawBody, receivedHmac, secret) {
@@ -213,6 +213,9 @@ app.post('/admin/generate-all-products', async (req, res) => {
         row.validation_passed = generated.validation?.passed === true;
         row.requires_review = generated.validation?.requires_review === true;
         row.safe_to_write = generated.validation?.safe_to_write_publishable_preview === true;
+        row.manual_content_approval = generated.manual_content_approval === true;
+        row.manual_override_eligible = generated.manual_override_eligible === true;
+        row.effective_safe_to_write = row.safe_to_write || (row.manual_content_approval && row.manual_override_eligible);
         row.source_hash = generated.source_hash;
         row.model = generated.model;
         row.generation_attempts = generated.generation_attempts || 1;
@@ -224,7 +227,7 @@ app.post('/admin/generate-all-products', async (req, res) => {
 
         successful += 1;
         if (row.requires_review) needsReview += 1;
-        if (row.written_metafields.length) written += 1;
+        if (row.written_metafields.includes('ingredient_story') || row.written_metafields.includes('formula_highlights') || row.written_metafields.includes('product_summary')) written += 1;
       } catch (error) {
         failed += 1;
         row.status = 'failed';
@@ -240,7 +243,7 @@ app.post('/admin/generate-all-products', async (req, res) => {
     }
 
     return res.status(200).json({
-      stage: write ? '4H-bulk-write-practical' : '4H-bulk-preview-practical',
+      stage: write ? '4I-bulk-write-manual-approval' : '4I-bulk-preview-manual-approval',
       writes_to_shopify: write,
       sync_sources: syncSources,
       delay_ms: delayMs,

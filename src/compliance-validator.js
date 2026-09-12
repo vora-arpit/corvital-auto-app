@@ -329,8 +329,20 @@ function decorateTextObject(value) {
   return copy;
 }
 
-export function buildPublishableContent(content, validation) {
-  if (!validation?.safe_to_write_publishable_preview) return null;
+export function buildPublishableContent(content, validation, { manualOverride = false } = {}) {
+  const nonOverridableCodes = new Set([
+    'DISEASE_OR_HIGH_RISK_CLAIM',
+    'INVALID_CLAIM_TYPE',
+  ]);
+
+  const hasNonOverridableIssue = (validation?.hard_issues || []).some((issue) =>
+    nonOverridableCodes.has(issue?.code)
+  );
+
+  const normallySafe = validation?.safe_to_write_publishable_preview === true;
+  const manuallySafe = manualOverride === true && !hasNonOverridableIssue;
+
+  if (!normallySafe && !manuallySafe) return null;
 
   const output = JSON.parse(JSON.stringify(content || {}));
 
