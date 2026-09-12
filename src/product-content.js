@@ -40,7 +40,9 @@ function serialize(value) {
 async function writeGeneratedMetafields(productId, content, validation, hash) {
   const publishableContent = stripReviewClaims(content, validation);
 
-  const status = !validation.safe_to_write
+  const canWritePublishable = validation.safe_to_write_publishable_preview === true;
+
+  const status = !canWritePublishable
     ? 'needs_review'
     : validation.requires_review
       ? 'approved_facts_claims_held'
@@ -48,7 +50,7 @@ async function writeGeneratedMetafields(productId, content, validation, hash) {
 
   // Hard validation problems: do not write generated presentation content.
   // We still write the review/status/hash so the issue is visible internally.
-  const fields = validation.safe_to_write
+  const fields = canWritePublishable
     ? {
         product_summary: publishableContent.product_summary,
         ingredient_story: publishableContent.ingredient_story || [],
@@ -98,7 +100,7 @@ export async function generateProductContent(productGid, { write = false } = {})
   const hash = sourceFingerprint(approvedSource);
   const generated = await generateGroundedContent(approvedSource);
   const validation = validateGeneratedContent(generated.content, approvedSource);
-  const publishablePreview = validation.safe_to_write
+  const publishablePreview = validation.safe_to_write_publishable_preview
     ? stripReviewClaims(generated.content, validation)
     : null;
 
@@ -113,7 +115,7 @@ export async function generateProductContent(productGid, { write = false } = {})
   }
 
   return {
-    stage: write ? '4B-write-enabled-strict' : '4A-preview-strict',
+    stage: write ? '4C-write-enabled-strict' : '4C-preview-strict',
     writes_to_shopify: Boolean(write),
     product: approvedSource.product,
     source_hash: hash,

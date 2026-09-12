@@ -14,8 +14,6 @@ const HARD_BLOCK_PATTERNS = [
   /\bhypertension\b/i,
 ];
 
-// These are not automatically prohibited. They are signals that the statement
-// is a health/wellness claim and therefore should not be auto-published as a fact.
 const REVIEW_CLAIM_PATTERNS = [
   /\bsupport(?:s|ed|ing)?\b/i,
   /\bmaintain(?:s|ed|ing)?\b/i,
@@ -44,11 +42,14 @@ const REVIEW_CLAIM_PATTERNS = [
 ];
 
 const VALID_CLAIM_TYPES = new Set([
-  'fact',
+  'objective_fact',
+  'ingredient_identity',
   'structure_function_claim',
   'general_wellbeing_claim',
   'disease_claim',
   'other_claim',
+  // Backward compatibility for one deployment cycle.
+  'fact',
 ]);
 
 function normalize(value) {
@@ -139,6 +140,13 @@ function validateIngredientFacts(content, approvedSource, hardIssues) {
   });
 }
 
+function normalizeClaimType(value) {
+  // Old preview output used "fact". Treat it as objective_fact only when the
+  // text itself does not contain health/physiology signals.
+  if (value === 'fact') return 'objective_fact';
+  return value;
+}
+
 export function validateGeneratedContent(content, approvedSource) {
   const hardIssues = [];
   const reviewIssues = [];
@@ -148,13 +156,14 @@ export function validateGeneratedContent(content, approvedSource) {
     const text = String(claim.text || '').trim();
     const sourceField = String(claim.source_field || '').trim();
     const sourceQuote = String(claim.source_quote || '').trim();
-    const claimType = String(claim.claim_type || '').trim();
+    const rawClaimType = String(claim.claim_type || '').trim();
+    const claimType = normalizeClaimType(rawClaimType);
 
-    if (!VALID_CLAIM_TYPES.has(claimType)) {
+    if (!VALID_CLAIM_TYPES.has(rawClaimType)) {
       addIssue(hardIssues, {
         code: 'MISSING_OR_INVALID_CLAIM_TYPE',
         location: claim.location,
-        claim_type: claimType || null,
+        claim_type: rawClaimType || null,
       });
     }
 
@@ -198,8 +207,12 @@ export function validateGeneratedContent(content, approvedSource) {
     }
 
     const looksLikeHealthClaim = containsAny(text, REVIEW_CLAIM_PATTERNS);
+    const isObjectiveType =
+      claimType === 'objective_fact' || claimType === 'ingredient_identity';
 
-    if (claimType !== 'fact' || looksLikeHealthClaim) {
+    // Objective facts/identity can auto-pass only when the actual text does
+    // not contain health, physiology, performance, outcome, or wellbeing wording.
+    if (!isObjectiveType || looksLikeHealthClaim) {
       addIssue(reviewIssues, {
         code: 'CLAIM_REQUIRES_REVIEW',
         location: claim.location,
@@ -212,7 +225,6 @@ export function validateGeneratedContent(content, approvedSource) {
 
   validateIngredientFacts(content, approvedSource, hardIssues);
 
-  // Usage fields must be exact copies of approved source values.
   const usage = content?.usage_display || null;
   if (usage) {
     const exactPairs = [
@@ -245,9 +257,15 @@ export function validateGeneratedContent(content, approvedSource) {
     }
   }
 
+  const hardPass = hardIssues.length === 0;
+
   return {
-    passed: hardIssues.length === 0,
-    safe_to_write: hardIssues.length === 0,
+    passed: hardPass,
+    // Clear name: this means only the FILTERED publishable preview is safe
+    // to persist. It does not mean every generated claim was approved.
+    safe_to_write_publishable_preview: hardPass,
+    // Deprecated compatibility alias for the existing Stage 4B caller.
+    safe_to_write: hardPass,
     requires_review: reviewIssues.length > 0 || hardIssues.length > 0,
     hard_issues: hardIssues,
     review_issues: reviewIssues,

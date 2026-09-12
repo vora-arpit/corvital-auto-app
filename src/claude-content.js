@@ -29,21 +29,23 @@ STRICT RULES
 
 CLAIM CLASSIFICATION
 Every prose statement must use exactly one claim_type:
-- "fact" = objective product/composition/identity information only, with no health, wellness, physiological, performance, or outcome implication.
+- "objective_fact" = objective product/composition information such as an ingredient amount or non-health product fact.
+- "ingredient_identity" = identity/definition only, such as an ingredient's full name, source plant, or chemical expansion, with no physiological or health implication.
 - "structure_function_claim" = wording about supporting, maintaining, promoting, or affecting normal body structure or function.
 - "general_wellbeing_claim" = wording about vitality, wellness, energy, overall well-being, feeling better, or similar general benefit.
 - "disease_claim" = wording that explicitly or implicitly suggests diagnosis, treatment, mitigation, cure, or prevention of disease.
 - "other_claim" = any other non-factual marketing or efficacy claim.
 
 IMPORTANT:
-- A source-grounded health claim is still a claim. Do NOT classify it as "fact" simply because it appears in APPROVED_SOURCE.
-- If unsure between "fact" and another type, choose the non-fact type.
+- A source-grounded health claim is still a claim. Do NOT classify it as "objective_fact" or "ingredient_identity" simply because it appears in APPROVED_SOURCE.
+- If a sentence mixes identity/fact language with a physiological or health effect, classify the whole statement as the appropriate claim type.
+- If unsure between an objective/identity type and another type, choose the non-objective claim type.
 
 OUTPUT SHAPE
 {
   "product_summary": null OR {
     "text": "...",
-    "claim_type": "fact|structure_function_claim|general_wellbeing_claim|disease_claim|other_claim",
+    "claim_type": "objective_fact|ingredient_identity|structure_function_claim|general_wellbeing_claim|disease_claim|other_claim",
     "source_field": "...",
     "source_quote": "exact quote"
   },
@@ -53,13 +55,13 @@ OUTPUT SHAPE
       "amount": null OR "exact source amount",
       "what_it_is": null OR {
         "text": "...",
-        "claim_type": "fact|structure_function_claim|general_wellbeing_claim|disease_claim|other_claim",
+        "claim_type": "objective_fact|ingredient_identity|structure_function_claim|general_wellbeing_claim|disease_claim|other_claim",
         "source_field": "...",
         "source_quote": "exact quote"
       },
       "why_in_formula": null OR {
         "text": "...",
-        "claim_type": "fact|structure_function_claim|general_wellbeing_claim|disease_claim|other_claim",
+        "claim_type": "objective_fact|ingredient_identity|structure_function_claim|general_wellbeing_claim|disease_claim|other_claim",
         "source_field": "...",
         "source_quote": "exact quote"
       }
@@ -70,7 +72,7 @@ OUTPUT SHAPE
       "title": "exact source-backed ingredient name or factual phrase only",
       "amount": null OR "exact source amount",
       "text": "...",
-      "claim_type": "fact|structure_function_claim|general_wellbeing_claim|disease_claim|other_claim",
+      "claim_type": "objective_fact|ingredient_identity|structure_function_claim|general_wellbeing_claim|disease_claim|other_claim",
       "source_field": "...",
       "source_quote": "exact quote"
     }
@@ -87,7 +89,7 @@ OUTPUT SHAPE
 }
 
 PUBLISHING INTENT
-Prefer objective factual content. Health/wellness claims may be returned only when explicitly present in APPROVED_SOURCE and must be classified accurately so the application can hold them for review.
+Prefer objective factual or ingredient-identity content. Health/wellness claims may be returned only when explicitly present in APPROVED_SOURCE and must be classified accurately so the application can hold them for review.
 `.trim();
 
 function parseClaudeJson(message) {

@@ -1289,6 +1289,59 @@ function extractIngredientHighlights(
 }
 
 
+
+
+/* ============================================================
+   STRICT FALLBACK EXTRACTION FOR SERVING FIELDS
+   ------------------------------------------------------------
+   Some Supliful descriptions place Serving Size / Servings Per
+   Container inline with other markup, which can cause the normal
+   line-based section parser to miss them. These helpers only
+   recover EXPLICITLY STATED values from the source text. They do
+   not calculate or infer servings from capsule count or dosage.
+============================================================ */
+
+function extractExplicitLabeledValue(sectionText, aliases) {
+  const source = String(sectionText || '')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\r/g, '')
+    .replace(/[ \t]+/g, ' ')
+    .trim();
+
+  if (!source) return '';
+
+  const allAliases = SECTION_DEFS.flatMap((def) => def.aliases);
+  const nextLabelPattern = allAliases
+    .map((alias) => escapeRegex(alias))
+    .sort((a, b) => b.length - a.length)
+    .join('|');
+
+  for (const alias of aliases) {
+    const escaped = escapeRegex(alias);
+
+    const pattern = new RegExp(
+      `(?:^|\n|\b)${escaped}\s*(?:\([^)]*\))?\s*[:\-–—]?\s*` +
+      `(.+?)(?=\n\s*(?:${nextLabelPattern})\s*(?:\([^)]*\))?\s*[:\-–—]?|$)`,
+      'i'
+    );
+
+    const match = source.match(pattern);
+    if (!match) continue;
+
+    const value = cleanValue(
+      alias.toLowerCase().includes('servings per')
+        ? 'servings_per_container'
+        : 'serving_size',
+      match[1]
+    );
+
+    if (value) return value;
+  }
+
+  return '';
+}
+
+
 /* ============================================================
    MAIN PARSER
 ============================================================ */
@@ -1384,6 +1437,35 @@ export function parseSuplifulDescription(descriptionHtml) {
 
 
   flush();
+
+
+  /* ----------------------------------------------------------
+     3B. Conservative serving-field fallback
+     Only recover values that are explicitly labeled in the
+     source. Never infer serving size or servings per container.
+  ---------------------------------------------------------- */
+
+  if (!result.serving_size) {
+    const explicitServingSize = extractExplicitLabeledValue(
+      sectionText,
+      ['serving size']
+    );
+
+    if (explicitServingSize) {
+      result.serving_size = explicitServingSize;
+    }
+  }
+
+  if (!result.servings_per_container) {
+    const explicitServingsPerContainer = extractExplicitLabeledValue(
+      sectionText,
+      ['servings per container', 'servings per bottle']
+    );
+
+    if (explicitServingsPerContainer) {
+      result.servings_per_container = explicitServingsPerContainer;
+    }
+  }
 
 
   /* ----------------------------------------------------------
