@@ -39,18 +39,15 @@ function serialize(value) {
 
 async function writeGeneratedMetafields(productId, content, validation, hash) {
   const publishableContent = stripReviewClaims(content, validation);
+  const canWrite = Boolean(publishableContent) && validation.safe_to_write_publishable_preview === true;
 
-  const canWritePublishable = validation.safe_to_write_publishable_preview === true;
-
-  const status = !canWritePublishable
+  const status = !canWrite
     ? 'needs_review'
     : validation.requires_review
-      ? 'approved_facts_claims_held'
+      ? 'approved_with_notes'
       : 'approved';
 
-  // Hard validation problems: do not write generated presentation content.
-  // We still write the review/status/hash so the issue is visible internally.
-  const fields = canWritePublishable
+  const fields = canWrite
     ? {
         product_summary: publishableContent.product_summary,
         ingredient_story: publishableContent.ingredient_story || [],
@@ -93,8 +90,8 @@ export async function generateProductContent(productGid, { write = false } = {})
   if (!product) throw new Error(`Product not found: ${productGid}`);
 
   const approvedSource = buildApprovedSource(product);
-  if (!Object.keys(approvedSource.sources).length) {
-    throw new Error(`No approved source metafields found for ${product.title}. Run source sync first.`);
+  if (!Object.keys(approvedSource.facts || {}).length) {
+    throw new Error(`No factual source metafields found for ${product.title}. Run source sync first.`);
   }
 
   const hash = sourceFingerprint(approvedSource);
@@ -115,11 +112,13 @@ export async function generateProductContent(productGid, { write = false } = {})
   }
 
   return {
-    stage: write ? '4C-write-enabled-strict' : '4C-preview-strict',
+    stage: write ? '4D-write-facts-approved-claims' : '4D-preview-facts-approved-claims',
     writes_to_shopify: Boolean(write),
     product: approvedSource.product,
     source_hash: hash,
-    source_fields: Object.keys(approvedSource.sources),
+    fact_fields: Object.keys(approvedSource.facts || {}),
+    approved_claims_count: (approvedSource.approved_claims || []).length,
+    serving_derivation: approvedSource.facts?.serving_derivation || null,
     model: generated.model,
     usage: generated.usage,
     generated: generated.content,

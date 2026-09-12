@@ -14,42 +14,11 @@ const HARD_BLOCK_PATTERNS = [
   /\bhypertension\b/i,
 ];
 
-const REVIEW_CLAIM_PATTERNS = [
-  /\bsupport(?:s|ed|ing)?\b/i,
-  /\bmaintain(?:s|ed|ing)?\b/i,
-  /\bpromot(?:e|es|ed|ing)\b/i,
-  /\bhelp(?:s|ed|ing)?\b/i,
-  /\bfunction\b/i,
-  /\bresponse\b/i,
-  /\bwellness\b/i,
-  /\bwell[- ]?being\b/i,
-  /\bvitality\b/i,
-  /\benergy\b/i,
-  /\bmetabolic\b/i,
-  /\bmetabolism\b/i,
-  /\bcognitive\b/i,
-  /\bcardiovascular\b/i,
-  /\bimmune\b/i,
-  /\brepair\b/i,
-  /\bantioxidant\b/i,
-  /\binflammat(?:ion|ory)\b/i,
-  /\bdigest(?:ion|ive)\b/i,
-  /\bsleep\b/i,
-  /\bstress\b/i,
-  /\bmood\b/i,
-  /\bperformance\b/i,
-  /\bhealth\b/i,
-];
-
 const VALID_CLAIM_TYPES = new Set([
-  'objective_fact',
-  'ingredient_identity',
-  'structure_function_claim',
-  'general_wellbeing_claim',
-  'disease_claim',
-  'other_claim',
-  // Backward compatibility for one deployment cycle.
   'fact',
+  'approved_claim',
+  'unapproved_claim',
+  'disease_claim',
 ]);
 
 function normalize(value) {
@@ -61,26 +30,29 @@ function normalize(value) {
     .toLowerCase();
 }
 
-function flattenSource(value) {
+function flatten(value) {
   if (value === null || value === undefined) return '';
   if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
     return String(value);
   }
-  if (Array.isArray(value)) return value.map(flattenSource).join(' | ');
-  if (typeof value === 'object') return Object.values(value).map(flattenSource).join(' | ');
+  if (Array.isArray(value)) return value.map(flatten).join(' | ');
+  if (typeof value === 'object') return Object.values(value).map(flatten).join(' | ');
   return '';
+}
+
+function addIssue(target, issue) {
+  target.push(issue);
 }
 
 function claimEntries(content) {
   const entries = [];
-
-  const pushClaim = (location, value) => {
+  const push = (location, value) => {
     if (!value || typeof value !== 'object') return;
     if (typeof value.text !== 'string' || !value.text.trim()) return;
     entries.push({ location, ...value });
   };
 
-  pushClaim('product_summary', content?.product_summary);
+  push('product_summary', content?.product_summary);
 
   const stories = Array.isArray(content?.ingredient_story)
     ? content.ingredient_story
@@ -89,34 +61,35 @@ function claimEntries(content) {
       : [];
 
   stories.forEach((story, index) => {
-    pushClaim(`ingredient_story[${index}].what_it_is`, story?.what_it_is);
-    pushClaim(`ingredient_story[${index}].why_in_formula`, story?.why_in_formula);
+    push(`ingredient_story[${index}].what_it_is`, story?.what_it_is);
+    push(`ingredient_story[${index}].why_in_formula`, story?.why_in_formula);
   });
 
   (content?.formula_highlights || []).forEach((item, index) => {
-    pushClaim(`formula_highlights[${index}]`, item);
+    push(`formula_highlights[${index}]`, item);
   });
 
   return entries;
 }
 
-function addIssue(target, issue) {
-  target.push(issue);
-}
-
-function containsAny(text, patterns) {
-  return patterns.some((pattern) => pattern.test(text));
+function approvedClaimsText(approvedSource) {
+  return (approvedSource?.approved_claims || [])
+    .map((item) => (typeof item === 'string' ? item : item?.text))
+    .filter(Boolean)
+    .join(' | ');
 }
 
 function validateIngredientFacts(content, approvedSource, hardIssues) {
-  const sourceText = normalize(flattenSource(approvedSource?.sources?.ingredients));
+  const sourceText = normalize(flatten([
+    approvedSource?.facts?.ingredients,
+    approvedSource?.facts?.ingredient_highlights,
+  ]));
+
   if (!sourceText) return;
 
   const stories = Array.isArray(content?.ingredient_story)
     ? content.ingredient_story
-    : content?.ingredient_story
-      ? [content.ingredient_story]
-      : [];
+    : [];
 
   stories.forEach((story, index) => {
     const name = String(story?.name || '').trim();
@@ -124,7 +97,7 @@ function validateIngredientFacts(content, approvedSource, hardIssues) {
 
     if (name && !sourceText.includes(normalize(name))) {
       addIssue(hardIssues, {
-        code: 'INGREDIENT_NAME_NOT_FOUND_IN_SOURCE',
+        code: 'INGREDIENT_NAME_NOT_FOUND_IN_FACTS',
         location: `ingredient_story[${index}].name`,
         value: name,
       });
@@ -132,7 +105,7 @@ function validateIngredientFacts(content, approvedSource, hardIssues) {
 
     if (amount && !sourceText.includes(normalize(amount))) {
       addIssue(hardIssues, {
-        code: 'INGREDIENT_AMOUNT_NOT_FOUND_IN_SOURCE',
+        code: 'INGREDIENT_AMOUNT_NOT_FOUND_IN_FACTS',
         location: `ingredient_story[${index}].amount`,
         value: amount,
       });
@@ -140,38 +113,42 @@ function validateIngredientFacts(content, approvedSource, hardIssues) {
   });
 }
 
-function normalizeClaimType(value) {
-  // Old preview output used "fact". Treat it as objective_fact only when the
-  // text itself does not contain health/physiology signals.
-  if (value === 'fact') return 'objective_fact';
-  return value;
-}
-
 export function validateGeneratedContent(content, approvedSource) {
   const hardIssues = [];
   const reviewIssues = [];
-  const sources = approvedSource?.sources || {};
+  const facts = approvedSource?.facts || {};
+  const approvedClaims = approvedClaimsText(approvedSource);
 
   for (const claim of claimEntries(content)) {
     const text = String(claim.text || '').trim();
+    const claimType = String(claim.claim_type || '').trim();
+    const sourceType = String(claim.source_type || '').trim();
     const sourceField = String(claim.source_field || '').trim();
     const sourceQuote = String(claim.source_quote || '').trim();
-    const rawClaimType = String(claim.claim_type || '').trim();
-    const claimType = normalizeClaimType(rawClaimType);
 
-    if (!VALID_CLAIM_TYPES.has(rawClaimType)) {
+    if (!VALID_CLAIM_TYPES.has(claimType)) {
       addIssue(hardIssues, {
-        code: 'MISSING_OR_INVALID_CLAIM_TYPE',
+        code: 'INVALID_CLAIM_TYPE',
         location: claim.location,
-        claim_type: rawClaimType || null,
+        claim_type: claimType || null,
       });
+      continue;
     }
 
-    if (!sourceField || !(sourceField in sources)) {
+    if (claimType === 'disease_claim' || HARD_BLOCK_PATTERNS.some((pattern) => pattern.test(text))) {
       addIssue(hardIssues, {
-        code: 'MISSING_OR_INVALID_SOURCE_FIELD',
+        code: 'DISEASE_OR_HIGH_RISK_CLAIM',
         location: claim.location,
-        source_field: sourceField || null,
+        text,
+      });
+      continue;
+    }
+
+    if (claimType === 'unapproved_claim') {
+      addIssue(hardIssues, {
+        code: 'UNAPPROVED_CLAIM_GENERATED',
+        location: claim.location,
+        text,
       });
       continue;
     }
@@ -184,42 +161,44 @@ export function validateGeneratedContent(content, approvedSource) {
       continue;
     }
 
-    const sourceText = normalize(flattenSource(sources[sourceField]));
-    const quoteText = normalize(sourceQuote);
+    if (claimType === 'fact') {
+      if (sourceType !== 'fact' || !(sourceField in facts)) {
+        addIssue(hardIssues, {
+          code: 'INVALID_FACT_SOURCE',
+          location: claim.location,
+          source_type: sourceType || null,
+          source_field: sourceField || null,
+        });
+        continue;
+      }
 
-    if (!sourceText.includes(quoteText)) {
-      addIssue(hardIssues, {
-        code: 'SOURCE_QUOTE_NOT_FOUND',
-        location: claim.location,
-        source_field: sourceField,
-        source_quote: sourceQuote,
-      });
+      const sourceText = normalize(flatten(facts[sourceField]));
+      if (!sourceText.includes(normalize(sourceQuote))) {
+        addIssue(hardIssues, {
+          code: 'FACT_SOURCE_QUOTE_NOT_FOUND',
+          location: claim.location,
+          source_field: sourceField,
+          source_quote: sourceQuote,
+        });
+      }
     }
 
-    if (containsAny(text, HARD_BLOCK_PATTERNS) || claimType === 'disease_claim') {
-      addIssue(hardIssues, {
-        code: 'DISEASE_OR_HIGH_RISK_CLAIM',
-        location: claim.location,
-        text,
-        claim_type: claimType || null,
-      });
-      continue;
-    }
+    if (claimType === 'approved_claim') {
+      if (sourceType !== 'approved_claim' || sourceField !== 'approved_claims') {
+        addIssue(hardIssues, {
+          code: 'INVALID_APPROVED_CLAIM_SOURCE',
+          location: claim.location,
+        });
+        continue;
+      }
 
-    const looksLikeHealthClaim = containsAny(text, REVIEW_CLAIM_PATTERNS);
-    const isObjectiveType =
-      claimType === 'objective_fact' || claimType === 'ingredient_identity';
-
-    // Objective facts/identity can auto-pass only when the actual text does
-    // not contain health, physiology, performance, outcome, or wellbeing wording.
-    if (!isObjectiveType || looksLikeHealthClaim) {
-      addIssue(reviewIssues, {
-        code: 'CLAIM_REQUIRES_REVIEW',
-        location: claim.location,
-        text,
-        claim_type: claimType || (looksLikeHealthClaim ? 'unclassified_health_claim' : null),
-        source_field: sourceField,
-      });
+      if (!normalize(approvedClaims).includes(normalize(sourceQuote))) {
+        addIssue(hardIssues, {
+          code: 'APPROVED_CLAIM_NOT_FOUND',
+          location: claim.location,
+          source_quote: sourceQuote,
+        });
+      }
     }
   }
 
@@ -227,33 +206,33 @@ export function validateGeneratedContent(content, approvedSource) {
 
   const usage = content?.usage_display || null;
   if (usage) {
-    const exactPairs = [
-      ['serving_size', 'serving_size'],
-      ['servings_per_container', 'servings_per_container'],
-      ['suggested_use', 'suggested_use'],
-    ];
-
-    for (const [outputKey, sourceKey] of exactPairs) {
-      const outputValue = usage[outputKey];
+    for (const key of ['serving_size', 'servings_per_container', 'suggested_use']) {
+      const outputValue = usage[key];
       if (outputValue === null || outputValue === undefined || outputValue === '') continue;
 
-      const sourceValue = sources[sourceKey];
+      const sourceValue = facts[key];
       if (sourceValue === null || sourceValue === undefined || sourceValue === '') {
         addIssue(hardIssues, {
-          code: 'USAGE_SOURCE_MISSING',
-          location: `usage_display.${outputKey}`,
-          source_field: sourceKey,
+          code: 'USAGE_FACT_MISSING',
+          location: `usage_display.${key}`,
         });
         continue;
       }
 
       if (normalize(outputValue) !== normalize(sourceValue)) {
         addIssue(hardIssues, {
-          code: 'USAGE_NOT_EXACT_SOURCE_COPY',
-          location: `usage_display.${outputKey}`,
-          source_field: sourceKey,
+          code: 'USAGE_NOT_EXACT_FACT_COPY',
+          location: `usage_display.${key}`,
         });
       }
+    }
+  }
+
+  // Claude's compliance notes are advisory only. They do not override the
+  // deterministic validator. Keep them visible as review notes if present.
+  for (const issue of content?.compliance?.issues || []) {
+    if (String(issue || '').trim()) {
+      reviewIssues.push({ code: 'MODEL_REVIEW_NOTE', text: String(issue).trim() });
     }
   }
 
@@ -261,11 +240,7 @@ export function validateGeneratedContent(content, approvedSource) {
 
   return {
     passed: hardPass,
-    // Clear name: this means only the FILTERED publishable preview is safe
-    // to persist. It does not mean every generated claim was approved.
     safe_to_write_publishable_preview: hardPass,
-    // Deprecated compatibility alias for the existing Stage 4B caller.
-    safe_to_write: hardPass,
     requires_review: reviewIssues.length > 0 || hardIssues.length > 0,
     hard_issues: hardIssues,
     review_issues: reviewIssues,
@@ -274,35 +249,9 @@ export function validateGeneratedContent(content, approvedSource) {
 }
 
 export function stripReviewClaims(content, validation) {
-  const reviewLocations = new Set(
-    (validation?.review_issues || []).map((issue) => issue.location)
-  );
-
-  const result = JSON.parse(JSON.stringify(content || {}));
-
-  if (reviewLocations.has('product_summary')) {
-    result.product_summary = null;
-  }
-
-  const stories = Array.isArray(result.ingredient_story)
-    ? result.ingredient_story
-    : result.ingredient_story
-      ? [result.ingredient_story]
-      : [];
-
-  stories.forEach((story, index) => {
-    if (reviewLocations.has(`ingredient_story[${index}].what_it_is`)) {
-      story.what_it_is = null;
-    }
-    if (reviewLocations.has(`ingredient_story[${index}].why_in_formula`)) {
-      story.why_in_formula = null;
-    }
-  });
-  result.ingredient_story = stories;
-
-  result.formula_highlights = (result.formula_highlights || []).filter(
-    (_item, index) => !reviewLocations.has(`formula_highlights[${index}]`)
-  );
-
-  return result;
+  // Under the Stage 4D model, an output either validates against FACTS /
+  // APPROVED_CLAIMS or it is a hard validation failure. No health claim is
+  // silently accepted merely because it came from raw marketing copy.
+  if (!validation?.safe_to_write_publishable_preview) return null;
+  return JSON.parse(JSON.stringify(content || {}));
 }

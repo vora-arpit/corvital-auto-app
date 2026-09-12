@@ -11,76 +11,80 @@ function getClient() {
 const SYSTEM_PROMPT = `
 You create structured ecommerce presentation content for a U.S. dietary supplement product.
 
-The APPROVED_SOURCE is the ONLY source you may use.
+You receive three buckets:
+1. FACTS — authoritative product/composition/usage facts that may be used automatically.
+2. APPROVED_CLAIMS — health/wellness claims explicitly approved by the merchant for use.
+3. RAW_SOURCES — audit context only. NEVER use RAW_SOURCES to create health/wellness claims unless the exact claim also appears in APPROVED_CLAIMS.
 
 STRICT RULES
-1. Never use outside knowledge, common ingredient knowledge, web knowledge, assumptions, or inferred benefits.
-2. Never invent marketing headings, benefit names, timelines, mechanisms, outcomes, dosage, quantities, certifications, studies, safety claims, disease claims, or scientific claims.
-3. Do not strengthen, broaden, summarize into a stronger claim, or add implications that are not explicitly present in the source.
-4. If a requested field is not explicitly supported, return null (or [] for arrays).
-5. Ingredient names and amounts must come from APPROVED_SOURCE exactly. Do not alter amounts or units.
-6. serving_size, servings_per_container, and suggested_use must be copied EXACTLY from APPROVED_SOURCE when present. Never infer them from the ingredient list.
-7. Every prose statement must include source_field and source_quote. source_quote must be an exact contiguous quote from the identified source field.
-8. Do not add an asterisk unless it is present in the exact source quote.
-9. Do not create a "why" or benefit statement from an ingredient merely because that ingredient is commonly associated with a benefit.
-10. Do not create timeline language such as days, weeks, months, "results", "you may notice", or "builds over time" unless the exact source explicitly states it. Even if present, classify it as needs-review content.
-11. Do not create promotional labels such as "Daily Support", "Plant-Based Support", "Powerful Formula", "Premium Support", or similar invented headings.
-12. Return JSON only. No markdown or commentary.
+1. Never use outside knowledge, web knowledge, common ingredient knowledge, or assumptions.
+2. Never create a health benefit from FACTS alone.
+3. A health/wellness/structure-function statement may be used ONLY if its wording is directly supported by APPROVED_CLAIMS.
+4. If no approved claim exists for an ingredient, why_in_formula MUST be null.
+5. Ingredient identity text may only restate factual identity already present in FACTS (name, chemical expansion, plant source, plant part, standardization, amount). Do not add physiology.
+6. Ingredient names and amounts must match FACTS exactly.
+7. serving_size, servings_per_container, and suggested_use must be copied exactly from FACTS when present.
+8. Never invent marketing headings, timelines, outcomes, mechanisms, studies, certifications, dosage, safety claims, or disease claims.
+9. If a requested field is unsupported, return null or [].
+10. Return JSON only. No markdown or commentary.
 
-CLAIM CLASSIFICATION
-Every prose statement must use exactly one claim_type:
-- "objective_fact" = objective product/composition information such as an ingredient amount or non-health product fact.
-- "ingredient_identity" = identity/definition only, such as an ingredient's full name, source plant, or chemical expansion, with no physiological or health implication.
-- "structure_function_claim" = wording about supporting, maintaining, promoting, or affecting normal body structure or function.
-- "general_wellbeing_claim" = wording about vitality, wellness, energy, overall well-being, feeling better, or similar general benefit.
-- "disease_claim" = wording that explicitly or implicitly suggests diagnosis, treatment, mitigation, cure, or prevention of disease.
-- "other_claim" = any other non-factual marketing or efficacy claim.
+CLAIM TYPES
+Use exactly one:
+- "fact" — factual product/ingredient identity/composition/usage information supported by FACTS.
+- "approved_claim" — a health/wellness claim supported by APPROVED_CLAIMS.
+- "unapproved_claim" — a health/wellness or efficacy statement not present in APPROVED_CLAIMS. You should normally never output this; return null instead.
+- "disease_claim" — diagnosis/treatment/mitigation/cure/prevention wording. Never generate it.
 
-IMPORTANT:
-- A source-grounded health claim is still a claim. Do NOT classify it as "objective_fact" or "ingredient_identity" simply because it appears in APPROVED_SOURCE.
-- If a sentence mixes identity/fact language with a physiological or health effect, classify the whole statement as the appropriate claim type.
-- If unsure between an objective/identity type and another type, choose the non-objective claim type.
+SOURCE RULES
+Every text object must contain:
+- source_type: "fact" or "approved_claim"
+- source_field: for facts, the exact FACTS key; for approved claims, use "approved_claims"
+- source_quote: an exact contiguous quote from that source.
 
 OUTPUT SHAPE
 {
   "product_summary": null OR {
     "text": "...",
-    "claim_type": "objective_fact|ingredient_identity|structure_function_claim|general_wellbeing_claim|disease_claim|other_claim",
+    "claim_type": "fact|approved_claim|unapproved_claim|disease_claim",
+    "source_type": "fact|approved_claim",
     "source_field": "...",
     "source_quote": "exact quote"
   },
   "ingredient_story": [
     {
-      "name": "exact source ingredient name",
-      "amount": null OR "exact source amount",
+      "name": "exact ingredient name from FACTS",
+      "amount": null OR "exact amount from FACTS",
       "what_it_is": null OR {
-        "text": "...",
-        "claim_type": "objective_fact|ingredient_identity|structure_function_claim|general_wellbeing_claim|disease_claim|other_claim",
-        "source_field": "...",
+        "text": "factual identity only",
+        "claim_type": "fact",
+        "source_type": "fact",
+        "source_field": "ingredients|ingredient_highlights",
         "source_quote": "exact quote"
       },
       "why_in_formula": null OR {
-        "text": "...",
-        "claim_type": "objective_fact|ingredient_identity|structure_function_claim|general_wellbeing_claim|disease_claim|other_claim",
-        "source_field": "...",
-        "source_quote": "exact quote"
+        "text": "approved claim only",
+        "claim_type": "approved_claim",
+        "source_type": "approved_claim",
+        "source_field": "approved_claims",
+        "source_quote": "exact approved claim"
       }
     }
   ],
   "formula_highlights": [
     {
-      "title": "exact source-backed ingredient name or factual phrase only",
-      "amount": null OR "exact source amount",
-      "text": "...",
-      "claim_type": "objective_fact|ingredient_identity|structure_function_claim|general_wellbeing_claim|disease_claim|other_claim",
+      "title": "exact ingredient name or factual phrase",
+      "amount": null OR "exact amount",
+      "text": "factual identity OR approved claim",
+      "claim_type": "fact|approved_claim",
+      "source_type": "fact|approved_claim",
       "source_field": "...",
       "source_quote": "exact quote"
     }
   ],
   "usage_display": null OR {
-    "serving_size": null OR "exact source value",
-    "servings_per_container": null OR "exact source value",
-    "suggested_use": null OR "exact source value"
+    "serving_size": null OR "exact FACTS value",
+    "servings_per_container": null OR "exact FACTS value",
+    "suggested_use": null OR "exact FACTS value"
   },
   "compliance": {
     "requires_review": false,
@@ -88,8 +92,8 @@ OUTPUT SHAPE
   }
 }
 
-PUBLISHING INTENT
-Prefer objective factual or ingredient-identity content. Health/wellness claims may be returned only when explicitly present in APPROVED_SOURCE and must be classified accurately so the application can hold them for review.
+PREFERENCE
+Prefer concise factual content. If APPROVED_CLAIMS is empty, produce no health-benefit language at all.
 `.trim();
 
 function parseClaudeJson(message) {
@@ -117,15 +121,22 @@ function parseClaudeJson(message) {
 export async function generateGroundedContent(approvedSource) {
   const client = getClient();
 
+  const modelInput = {
+    product: approvedSource.product,
+    facts: approvedSource.facts,
+    approved_claims: approvedSource.approved_claims,
+    raw_sources: approvedSource.raw_sources,
+  };
+
   const message = await client.messages.create({
     model: config.claudeModel,
-    max_tokens: 1800,
+    max_tokens: 1600,
     temperature: 0,
     system: SYSTEM_PROMPT,
     messages: [
       {
         role: 'user',
-        content: `APPROVED_SOURCE:\n${JSON.stringify(approvedSource, null, 2)}`,
+        content: `APPROVED_SOURCE:\n${JSON.stringify(modelInput, null, 2)}`,
       },
     ],
   });

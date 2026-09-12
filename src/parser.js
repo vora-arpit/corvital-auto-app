@@ -1,4 +1,5 @@
 import * as cheerio from 'cheerio';
+import { deriveServingInfo } from './serving-utils.js';
 
 /* ============================================================
    CORVITAL PLUS — SUPLIFUL DESCRIPTION PARSER
@@ -168,6 +169,7 @@ export const METAFIELD_TYPES = {
 
   serving_size: 'single_line_text_field',
   servings_per_container: 'single_line_text_field',
+  serving_derivation: 'json',
 
   suggested_use: 'multi_line_text_field',
   caution: 'multi_line_text_field',
@@ -1469,6 +1471,44 @@ export function parseSuplifulDescription(descriptionHtml) {
 
 
   /* ----------------------------------------------------------
+     3C. Deterministic serving derivation
+     If explicit Supplement Facts values are absent, derive only
+     from authoritative suggested_use + product_amount.
+
+     Example:
+       suggested_use: "take two (2) capsules daily"
+       product_amount: "60 capsules / ..."
+       -> serving_size: "2 capsules"
+       -> servings_per_container: "30"
+
+     Ambiguous ranges / multi-dose instructions are refused.
+  ---------------------------------------------------------- */
+
+  if (!result.serving_size || !result.servings_per_container) {
+    const derivedServing = deriveServingInfo({
+      suggested_use: result.suggested_use,
+      product_amount: result.product_amount,
+    });
+
+    let usedDerivation = false;
+
+    if (!result.serving_size && derivedServing.serving_size) {
+      result.serving_size = derivedServing.serving_size;
+      usedDerivation = true;
+    }
+
+    if (!result.servings_per_container && derivedServing.servings_per_container) {
+      result.servings_per_container = derivedServing.servings_per_container;
+      usedDerivation = true;
+    }
+
+    if (usedDerivation) {
+      result.serving_derivation = derivedServing.derivation;
+    }
+  }
+
+
+  /* ----------------------------------------------------------
      4. Marketing description
   ---------------------------------------------------------- */
 
@@ -1566,7 +1606,7 @@ export function toMetafieldValue(key, value) {
   /*
     Stage 1 structured ingredient JSON.
   */
-  if (key === 'ingredient_highlights') {
+  if (key === 'ingredient_highlights' || key === 'serving_derivation') {
     return JSON.stringify(
       Array.isArray(value)
         ? value

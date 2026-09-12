@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
+import { deriveServingInfo } from './serving-utils.js';
 
-const SOURCE_KEYS = [
+const RAW_SOURCE_KEYS = [
   'description_clean',
   'ingredients',
   'other_ingredients',
@@ -10,6 +11,7 @@ const SOURCE_KEYS = [
   'gross_weight',
   'serving_size',
   'servings_per_container',
+  'serving_derivation',
   'suggested_use',
   'caution',
   'iron_warning',
@@ -18,6 +20,7 @@ const SOURCE_KEYS = [
   'fda_disclaimer',
   'product_attributes',
   'ingredient_highlights',
+  'approved_claims',
 ];
 
 function parseMaybeJson(value) {
@@ -32,18 +35,97 @@ function parseMaybeJson(value) {
   }
 }
 
+function normalizeApprovedClaims(value) {
+  if (!value) return [];
+  const parsed = parseMaybeJson(value);
+  const items = Array.isArray(parsed) ? parsed : [parsed];
+
+  return items
+    .map((item) => {
+      if (typeof item === 'string') {
+        const text = item.trim();
+        return text ? { text, source: 'manual_approval' } : null;
+      }
+      if (item && typeof item === 'object' && typeof item.text === 'string') {
+        const text = item.text.trim();
+        if (!text) return null;
+        return {
+          text,
+          source: item.source || 'manual_approval',
+          note: item.note || null,
+        };
+      }
+      return null;
+    })
+    .filter(Boolean);
+}
+
+function compactObject(value) {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, item]) => {
+      if (item === null || item === undefined) return false;
+      if (typeof item === 'string' && !item.trim()) return false;
+      if (Array.isArray(item) && item.length === 0) return false;
+      return true;
+    })
+  );
+}
+
 export function buildApprovedSource(product) {
   const metafields = new Map(
     (product?.metafields?.nodes || []).map((node) => [node.key, node.value])
   );
 
-  const sources = {};
-  for (const key of SOURCE_KEYS) {
+  const rawSources = {};
+  for (const key of RAW_SOURCE_KEYS) {
     const value = metafields.get(key);
     if (value !== undefined && value !== null && String(value).trim() !== '') {
-      sources[key] = parseMaybeJson(value);
+      rawSources[key] = parseMaybeJson(value);
     }
   }
+
+  // Runtime fallback so the content endpoint works even before a backfill has
+  // persisted the new derived serving metafields.
+  if (!rawSources.serving_size || !rawSources.servings_per_container) {
+    const derived = deriveServingInfo({
+      suggested_use: rawSources.suggested_use,
+      product_amount: rawSources.product_amount,
+    });
+
+    if (!rawSources.serving_size && derived.serving_size) {
+      rawSources.serving_size = derived.serving_size;
+    }
+    if (!rawSources.servings_per_container && derived.servings_per_container) {
+      rawSources.servings_per_container = derived.servings_per_container;
+    }
+    if (!rawSources.serving_derivation && (derived.serving_size || derived.servings_per_container)) {
+      rawSources.serving_derivation = derived.derivation;
+    }
+  }
+
+  const approvedClaims = normalizeApprovedClaims(rawSources.approved_claims);
+
+  // Facts are the only auto-publishable knowledge Claude receives. The raw
+  // marketing description is intentionally excluded from facts because it may
+  // contain structure/function claims that have not been explicitly approved.
+  const facts = compactObject({
+    ingredients: rawSources.ingredients,
+    ingredient_highlights: rawSources.ingredient_highlights,
+    other_ingredients: rawSources.other_ingredients,
+    contains: rawSources.contains,
+    manufacturer_country: rawSources.manufacturer_country,
+    product_amount: rawSources.product_amount,
+    gross_weight: rawSources.gross_weight,
+    serving_size: rawSources.serving_size,
+    servings_per_container: rawSources.servings_per_container,
+    serving_derivation: rawSources.serving_derivation,
+    suggested_use: rawSources.suggested_use,
+    caution: rawSources.caution,
+    iron_warning: rawSources.iron_warning,
+    warning: rawSources.warning,
+    storage: rawSources.storage,
+    product_attributes: rawSources.product_attributes,
+  });
 
   return {
     product: {
@@ -51,7 +133,11 @@ export function buildApprovedSource(product) {
       title: product.title,
       handle: product.handle,
     },
-    sources,
+    facts,
+    approved_claims: approvedClaims,
+    // Kept for internal audit/debugging only. Claude is instructed not to use
+    // raw marketing prose unless a claim has separately been approved.
+    raw_sources: rawSources,
   };
 }
 
@@ -63,6 +149,9 @@ function stableStringify(value) {
 }
 
 export function sourceFingerprint(approvedSource) {
-  const canonical = stableStringify(approvedSource.sources);
+  const canonical = stableStringify({
+    facts: approvedSource.facts,
+    approved_claims: approvedSource.approved_claims,
+  });
   return crypto.createHash('sha256').update(canonical).digest('hex');
 }
