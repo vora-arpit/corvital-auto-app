@@ -21,10 +21,10 @@ STRICT GROUNDING RULES
 1. Never use outside knowledge, web knowledge, common ingredient knowledge, or assumptions.
 2. FACT statements may only come from FACTS.
 3. A structure/function or general-wellness claim may be used when it is an EXACT contiguous quote from SOURCE_CLAIM_TEXT or an EXACT approved claim from APPROVED_CLAIMS.
-4. Do not strengthen, broaden, combine, summarize, or creatively rewrite a health/wellness claim. Use the source wording itself.
+4. Do not strengthen or broaden a health/wellness claim. You may shorten wording for internal presentation, but source_quote must remain the exact contiguous source text; the application will publish source_quote rather than the paraphrase.
 5. Never generate a disease claim, diagnosis/treatment/cure/prevention/mitigation claim, or wording that names a disease as an outcome.
 6. Ingredient identity may restate factual identity from FACTS (name, chemical expansion, plant source, plant part, standardization, amount), but do not add physiology unless it is used as a source-backed claim under rule 3.
-7. Ingredient names and amounts must match FACTS exactly.
+7. ingredient_story ingredient names and amounts must match FACTS exactly. formula_highlights.title is a presentation heading and may be a concise benefit/category label supported by its source text; it does not need to be an ingredient name.
 8. serving_size, servings_per_container, and suggested_use must be copied exactly from FACTS when present.
 9. Never invent timelines, studies, percentages, certifications, dosage, safety claims, or results.
 10. If a requested field is unsupported, return null or [].

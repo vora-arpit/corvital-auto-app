@@ -81,6 +81,13 @@ function structuredIngredientText(approvedSource) {
   ]));
 }
 
+function allAuthoritativeSourceText(approvedSource) {
+  return normalize(flatten([
+    approvedSource?.facts,
+    approvedSource?.raw_sources,
+  ]));
+}
+
 function validateIngredientFacts(content, approvedSource, hardIssues) {
   const sourceText = structuredIngredientText(approvedSource);
   if (!sourceText) return;
@@ -89,18 +96,16 @@ function validateIngredientFacts(content, approvedSource, hardIssues) {
     ? content.ingredient_story
     : [];
 
-  const rows = [
-    ...stories.map((story, index) => ({
-      location: `ingredient_story[${index}]`,
-      name: story?.name,
-      amount: story?.amount,
-    })),
-    ...(content?.formula_highlights || []).map((item, index) => ({
-      location: `formula_highlights[${index}]`,
-      name: item?.title,
-      amount: item?.amount,
-    })),
-  ];
+  // Only ingredient_story rows represent actual ingredient identities.
+  // formula_highlights titles are presentation labels and are intentionally
+  // allowed to be benefit/category headings such as "Sleep Support".
+  const rows = stories.map((story, index) => ({
+    location: `ingredient_story[${index}]`,
+    name: story?.name,
+    amount: story?.amount,
+  }));
+
+  const broadSourceText = allAuthoritativeSourceText(approvedSource);
 
   for (const row of rows) {
     const name = String(row.name || '').trim();
@@ -114,9 +119,11 @@ function validateIngredientFacts(content, approvedSource, hardIssues) {
       });
     }
 
-    if (amount && !sourceText.includes(normalize(amount))) {
+    // Amounts can sometimes be present in the authoritative raw supplement
+    // source even when the parsed ingredient_highlights omitted them.
+    if (amount && !sourceText.includes(normalize(amount)) && !broadSourceText.includes(normalize(amount))) {
       hardIssues.push({
-        code: 'INGREDIENT_AMOUNT_NOT_FOUND_IN_FACTS',
+        code: 'INGREDIENT_AMOUNT_NOT_FOUND_IN_SOURCE',
         location: `${row.location}.amount`,
         value: amount,
       });
@@ -224,16 +231,9 @@ export function validateGeneratedContent(content, approvedSource) {
         continue;
       }
 
-      // To prevent strengthening or creative paraphrase, source-backed claim
-      // display text must match the source quote (ignoring whitespace/case).
-      if (normalize(text) !== normalize(sourceQuote)) {
-        hardIssues.push({
-          code: 'SOURCE_CLAIM_REWORDED',
-          location: claim.location,
-          text,
-          source_quote: sourceQuote,
-        });
-      }
+      // Minor shortening/grammar cleanup by the model is allowed here.
+      // We do not publish the rewritten wording: buildPublishableContent()
+      // deterministically replaces it with the exact verified source_quote.
       continue;
     }
 
@@ -255,14 +255,8 @@ export function validateGeneratedContent(content, approvedSource) {
         continue;
       }
 
-      if (normalize(text) !== normalize(sourceQuote)) {
-        hardIssues.push({
-          code: 'APPROVED_CLAIM_REWORDED',
-          location: claim.location,
-          text,
-          source_quote: sourceQuote,
-        });
-      }
+      // As with source claims, publish the exact approved source wording
+      // rather than any model paraphrase.
     }
   }
 
@@ -326,7 +320,11 @@ function decorateTextObject(value) {
   if (!value || typeof value !== 'object') return value;
   const copy = { ...value };
   if (copy.claim_type === 'source_claim' || copy.claim_type === 'approved_claim') {
-    copy.text = appendClaimAsterisk(copy.text);
+    // Always publish the exact validated source wording, never Claude's
+    // shortened/paraphrased variant. This keeps claims source-grounded while
+    // still allowing Claude to choose and organize them for presentation.
+    const exactSourceText = String(copy.source_quote || '').trim();
+    copy.text = appendClaimAsterisk(exactSourceText || copy.text);
   }
   return copy;
 }

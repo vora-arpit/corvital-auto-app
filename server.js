@@ -240,7 +240,7 @@ app.post('/admin/generate-all-products', async (req, res) => {
     }
 
     return res.status(200).json({
-      stage: write ? '4G-bulk-write-structured' : '4G-bulk-preview-structured',
+      stage: write ? '4H-bulk-write-practical' : '4H-bulk-preview-practical',
       writes_to_shopify: write,
       sync_sources: syncSources,
       delay_ms: delayMs,
