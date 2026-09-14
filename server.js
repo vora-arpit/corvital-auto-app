@@ -3,11 +3,15 @@ import express from 'express';
 
 import { config } from './src/config.js';
 import { syncProduct, listAllProducts } from './src/sync-product.js';
-import { generateProductContent } from './src/product-content.js';
+import {
+  generateProductContent,
+  getProductContentAutomationState,
+} from './src/product-content.js';
 
 const app = express();
-const APP_VERSION = 'stage4j-direct-manual-approval-2026-09-12';
+const APP_VERSION = 'stage4k-auto-webhook-content-2026-09-14';
 const seenWebhookIds = new Map();
+const productAutomationLocks = new Map();
 
 function verifyWithSecret(rawBody, receivedHmac, secret) {
   if (!receivedHmac || !secret || !Buffer.isBuffer(rawBody)) return false;
@@ -48,11 +52,68 @@ function secureStringEqual(a, b) {
   return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
 }
 
+async function runAutomaticProductContent(productGid, topic = 'unknown') {
+  if (productAutomationLocks.has(productGid)) {
+    console.log(`[auto-content] ${productGid} already processing; skipping duplicate ${topic}`);
+    return { skipped: true, reason: 'already_processing' };
+  }
+
+  const task = (async () => {
+    // First refresh deterministic Supliful/source metafields.
+    const sourceSync = await syncProduct(productGid);
+
+    // Cheap GraphQL/hash check. This does NOT call Claude.
+    const state = await getProductContentAutomationState(productGid);
+
+    if (!state.should_generate) {
+      console.log(`[auto-content] ${topic} ${productGid} skipped: ${state.reason}`);
+      return {
+        skipped: true,
+        reason: state.reason,
+        source_sync: sourceSync,
+        state,
+      };
+    }
+
+    console.log(`[auto-content] ${topic} ${productGid} generating: ${state.reason}`);
+
+    // Write=true because automatic runs are intended to populate the storefront.
+    // If validation requires review, generateProductContent writes only status/review/hash.
+    // When you later set Manual content approval = true and Save in Shopify, the next
+    // PRODUCTS_UPDATE webhook re-enters here and writes the generated content automatically.
+    const generated = await generateProductContent(productGid, { write: true });
+
+    return {
+      skipped: false,
+      reason: state.reason,
+      source_sync: sourceSync,
+      state,
+      result: {
+        validation_passed: generated.validation?.passed === true,
+        requires_review: generated.validation?.requires_review === true,
+        manual_content_approval: generated.manual_content_approval === true,
+        manual_override_eligible: generated.manual_override_eligible === true,
+        written_metafields: generated.written_metafields || [],
+        content_status_written: (generated.written_metafields || []).includes('content_status'),
+      },
+    };
+  })();
+
+  productAutomationLocks.set(productGid, task);
+
+  try {
+    return await task;
+  } finally {
+    productAutomationLocks.delete(productGid);
+  }
+}
+
 app.get('/', (_req, res) => {
   res.status(200).json({
     service: 'CorVital Plus Metafield Automation',
     status: 'running',
     version: APP_VERSION,
+    automaticProductContent: true,
     health: '/health',
     webhook: '/webhooks/products',
     contentGenerator: '/admin/generate-product-content/:productId',
@@ -66,6 +127,7 @@ app.get('/health', (_req, res) => {
     ok: true,
     service: 'corvital-metafield-automation',
     version: APP_VERSION,
+    automatic_product_content: true,
     timestamp: new Date().toISOString(),
   });
 });
@@ -111,12 +173,16 @@ app.post(
     if (!gid) return res.status(200).send('No product id');
 
     try {
-      const result = await syncProduct(gid);
+      const result = await runAutomaticProductContent(gid, topic);
       console.log(`[webhook] ${topic} -> ${gid}`, result);
-      return res.status(200).send('OK');
+      return res.status(200).json({
+        ok: true,
+        product: gid,
+        automatic_content: result,
+      });
     } catch (error) {
       console.error(`[webhook] Failed ${topic} ${gid}:`, error);
-      return res.status(500).send('Product sync failed');
+      return res.status(500).send('Product automation failed');
     }
   }
 );
@@ -136,8 +202,6 @@ app.post('/admin/generate-product-content/:productId', async (req, res) => {
     return res.status(400).json({ error: 'Invalid Shopify product ID' });
   }
 
-  // Preview by default. Pass JSON body { "write": true } only when you want
-  // validated content written to Shopify metafields.
   const write = req.body?.write === true;
   const productGid = `gid://shopify/Product/${numericProductId}`;
 
@@ -152,8 +216,6 @@ app.post('/admin/generate-product-content/:productId', async (req, res) => {
   }
 });
 
-
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -166,10 +228,6 @@ app.post('/admin/generate-all-products', async (req, res) => {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
-  // Safe defaults:
-  // - preview only unless write === true
-  // - refresh source metafields before Claude unless sync_sources === false
-  // - wait 1.5 seconds between products to reduce rate-limit pressure
   const write = req.body?.write === true;
   const syncSources = req.body?.sync_sources !== false;
   const requestedDelay = Number(req.body?.delay_ms ?? 1500);
@@ -177,7 +235,6 @@ app.post('/admin/generate-all-products', async (req, res) => {
     ? Math.max(500, Math.min(10000, Math.round(requestedDelay)))
     : 1500;
 
-  // Optional limit is useful for a small test run, e.g. {"write":false,"limit":2}
   const requestedLimit = Number(req.body?.limit ?? 0);
   const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
     ? Math.max(1, Math.min(100, Math.floor(requestedLimit)))
@@ -228,7 +285,11 @@ app.post('/admin/generate-all-products', async (req, res) => {
 
         successful += 1;
         if (row.requires_review) needsReview += 1;
-        if (row.written_metafields.includes('ingredient_story') || row.written_metafields.includes('formula_highlights') || row.written_metafields.includes('product_summary')) written += 1;
+        if (
+          row.written_metafields.includes('ingredient_story') ||
+          row.written_metafields.includes('formula_highlights') ||
+          row.written_metafields.includes('product_summary')
+        ) written += 1;
       } catch (error) {
         failed += 1;
         row.status = 'failed';
@@ -244,7 +305,7 @@ app.post('/admin/generate-all-products', async (req, res) => {
     }
 
     return res.status(200).json({
-      stage: write ? '4J-bulk-write-direct-manual-approval' : '4J-bulk-preview-direct-manual-approval',
+      stage: write ? '4K-bulk-write-auto-webhook' : '4K-bulk-preview-auto-webhook',
       writes_to_shopify: write,
       sync_sources: syncSources,
       delay_ms: delayMs,
@@ -263,13 +324,9 @@ app.post('/admin/generate-all-products', async (req, res) => {
   }
 });
 
-app.use((req, res) => {
-  res.status(404).json({ error: 'Route not found', method: req.method, path: req.path });
+const port = config.port || process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`CorVital automation ${APP_VERSION} listening on port ${port}`);
 });
 
-app.listen(config.port, () => {
-  console.log(`CorVital metafield automation ${APP_VERSION} listening on port ${config.port}`);
-  console.log('Webhook path: /webhooks/products');
-  console.log('Content generator: /admin/generate-product-content/:productId');
-  console.log('Bulk content generator: /admin/generate-all-products');
-});
+export default app;

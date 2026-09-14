@@ -24,6 +24,48 @@ const CONTENT_PRODUCT_QUERY = `#graphql
         value
       }
 
+      contentStatus: metafield(namespace: "custom", key: "content_status") {
+        key
+        type
+        value
+      }
+
+      contentReview: metafield(namespace: "custom", key: "content_review") {
+        key
+        type
+        value
+      }
+
+      contentSourceHash: metafield(namespace: "custom", key: "content_source_hash") {
+        key
+        type
+        value
+      }
+
+      productSummary: metafield(namespace: "custom", key: "product_summary") {
+        key
+        type
+        value
+      }
+
+      ingredientStory: metafield(namespace: "custom", key: "ingredient_story") {
+        key
+        type
+        value
+      }
+
+      formulaHighlights: metafield(namespace: "custom", key: "formula_highlights") {
+        key
+        type
+        value
+      }
+
+      usageDisplay: metafield(namespace: "custom", key: "usage_display") {
+        key
+        type
+        value
+      }
+
       metafields(first: 100, namespace: "custom") {
         nodes {
           key
@@ -48,19 +90,33 @@ function serialize(value) {
   return typeof value === 'string' ? value : JSON.stringify(value);
 }
 
-function metafieldMap(product) {
-  const map = new Map();
-  for (const node of product?.metafields?.nodes || []) {
-    map.set(node.key, node);
-  }
-  return map;
+function parseBooleanValue(value) {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  return normalized === 'true' || normalized === '1' || normalized === 'yes';
 }
 
-function metafieldBoolean(product, key) {
-  const node = metafieldMap(product).get(key);
-  if (!node) return false;
-  const value = String(node.value ?? '').trim().toLowerCase();
-  return value === 'true' || value === '1' || value === 'yes';
+function parseJsonValue(value, fallback = null) {
+  if (value === null || value === undefined || value === '') return fallback;
+  if (typeof value === 'object') return value;
+  try {
+    return JSON.parse(String(value));
+  } catch {
+    return fallback;
+  }
+}
+
+function hasMeaningfulMetafield(node) {
+  if (!node || node.value === null || node.value === undefined) return false;
+  const raw = String(node.value).trim();
+  if (!raw || raw === 'null' || raw === '[]' || raw === '{}') return false;
+  return true;
+}
+
+async function fetchContentProduct(productGid) {
+  const data = await shopifyGraphQL(CONTENT_PRODUCT_QUERY, { id: productGid });
+  const product = data?.product;
+  if (!product) throw new Error(`Product not found: ${productGid}`);
+  return product;
 }
 
 async function writeGeneratedMetafields(productId, content, validation, hash, { manualApproved = false } = {}) {
@@ -122,18 +178,102 @@ async function writeGeneratedMetafields(productId, content, validation, hash, { 
   return result.metafields;
 }
 
-export async function generateProductContent(productGid, { write = false } = {}) {
-  const data = await shopifyGraphQL(CONTENT_PRODUCT_QUERY, { id: productGid });
-  const product = data?.product;
+/**
+ * Cheap preflight used by the Shopify product webhook.
+ * It does NOT call Claude.
+ *
+ * It triggers content generation only when:
+ * 1) this product has never been generated before,
+ * 2) source facts changed (source hash differs),
+ * 3) a previously reviewed product was manually approved by the merchant, or
+ * 4) an approved product is missing its generated display metafields.
+ *
+ * This prevents price/inventory/image/metafield update webhooks from wasting
+ * Claude credits and prevents generated-metafield writes from causing loops.
+ */
+export async function getProductContentAutomationState(productGid) {
+  const product = await fetchContentProduct(productGid);
+  const approvedSource = buildApprovedSource(product);
+  const factCount = Object.keys(approvedSource.facts || {}).length;
 
-  if (!product) throw new Error(`Product not found: ${productGid}`);
+  if (!factCount) {
+    return {
+      should_generate: false,
+      reason: 'no_source_facts',
+      product: approvedSource.product,
+      manual_content_approval: parseBooleanValue(product?.manualContentApproval?.value),
+      content_status: String(product?.contentStatus?.value || ''),
+      current_source_hash: null,
+      stored_source_hash: String(product?.contentSourceHash?.value || ''),
+    };
+  }
+
+  const currentHash = sourceFingerprint(approvedSource);
+  const storedHash = String(product?.contentSourceHash?.value || '').trim();
+  const contentStatus = String(product?.contentStatus?.value || '').trim();
+  const manualApproved = parseBooleanValue(product?.manualContentApproval?.value);
+  const previousReview = parseJsonValue(product?.contentReview?.value, {}) || {};
+
+  const hasGeneratedContent = [
+    product?.productSummary,
+    product?.ingredientStory,
+    product?.formulaHighlights,
+    product?.usageDisplay,
+  ].some(hasMeaningfulMetafield);
+
+  const approvedStatuses = new Set(['approved', 'approved_manual', 'approved_with_notes']);
+  const sourceChanged = Boolean(storedHash) && storedHash !== currentHash;
+  const neverGenerated = !storedHash && !contentStatus;
+
+  // When the app previously stored needs_review with manual approval = false,
+  // turning the Shopify boolean to true is the signal to retry automatically.
+  // If manual approval was already tried and still could not be applied (for
+  // example a non-bypassable disease claim), do not loop on every webhook.
+  const manualApprovalJustGranted =
+    manualApproved === true &&
+    contentStatus === 'needs_review' &&
+    previousReview?.manual_content_approval !== true;
+
+  const approvedButMissingDisplayContent =
+    approvedStatuses.has(contentStatus) && !hasGeneratedContent;
+
+  let reason = 'up_to_date';
+  let shouldGenerate = false;
+
+  if (neverGenerated) {
+    shouldGenerate = true;
+    reason = 'new_product_or_never_generated';
+  } else if (sourceChanged) {
+    shouldGenerate = true;
+    reason = 'source_changed';
+  } else if (manualApprovalJustGranted) {
+    shouldGenerate = true;
+    reason = 'manual_approval_granted';
+  } else if (approvedButMissingDisplayContent) {
+    shouldGenerate = true;
+    reason = 'approved_content_missing';
+  }
+
+  return {
+    should_generate: shouldGenerate,
+    reason,
+    product: approvedSource.product,
+    manual_content_approval: manualApproved,
+    content_status: contentStatus || null,
+    has_generated_content: hasGeneratedContent,
+    current_source_hash: currentHash,
+    stored_source_hash: storedHash || null,
+    source_changed: sourceChanged,
+    previous_manual_approval_seen: previousReview?.manual_content_approval === true,
+    previous_manual_approval_applied: previousReview?.manual_approval_applied === true,
+  };
+}
+
+export async function generateProductContent(productGid, { write = false } = {}) {
+  const product = await fetchContentProduct(productGid);
 
   const manualApprovalRaw = String(product?.manualContentApproval?.value ?? '').trim();
-  const manualApprovalNormalized = manualApprovalRaw.toLowerCase();
-  const manualApproved =
-    manualApprovalNormalized === 'true' ||
-    manualApprovalNormalized === '1' ||
-    manualApprovalNormalized === 'yes';
+  const manualApproved = parseBooleanValue(manualApprovalRaw);
 
   const approvedSource = buildApprovedSource(product);
   if (!Object.keys(approvedSource.facts || {}).length) {
@@ -158,8 +298,12 @@ export async function generateProductContent(productGid, { write = false } = {})
     );
   }
 
+  const nonBypassable = (validation.hard_issues || []).some((issue) =>
+    ['DISEASE_OR_HIGH_RISK_CLAIM', 'INVALID_CLAIM_TYPE'].includes(issue?.code)
+  );
+
   return {
-    stage: write ? '4J-write-direct-manual-approval' : '4J-preview-direct-manual-approval',
+    stage: write ? '4K-write-auto-webhook-manual-approval' : '4K-preview-auto-webhook-manual-approval',
     writes_to_shopify: Boolean(write),
     product: approvedSource.product,
     source_hash: hash,
@@ -171,7 +315,7 @@ export async function generateProductContent(productGid, { write = false } = {})
       raw_value: product?.manualContentApproval?.value ?? null,
     },
     manual_content_approval: manualApproved,
-    manual_override_eligible: manualApproved && !(validation.hard_issues || []).some((issue) => ['DISEASE_OR_HIGH_RISK_CLAIM', 'INVALID_CLAIM_TYPE'].includes(issue?.code)),
+    manual_override_eligible: manualApproved && !nonBypassable,
     fact_fields: Object.keys(approvedSource.facts || {}),
     has_source_claim_text: Boolean(approvedSource.source_claim_text),
     approved_claims_count: (approvedSource.approved_claims || []).length,
