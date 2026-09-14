@@ -6,7 +6,7 @@ import { syncProduct, listAllProducts } from './src/sync-product.js';
 import { generateProductContent } from './src/product-content.js';
 
 const app = express();
-const APP_VERSION = 'stage4i-manual-approval-2026-09-12';
+const APP_VERSION = 'stage4j-direct-manual-approval-2026-09-12';
 const seenWebhookIds = new Map();
 
 function verifyWithSecret(rawBody, receivedHmac, secret) {
@@ -214,6 +214,7 @@ app.post('/admin/generate-all-products', async (req, res) => {
         row.requires_review = generated.validation?.requires_review === true;
         row.safe_to_write = generated.validation?.safe_to_write_publishable_preview === true;
         row.manual_content_approval = generated.manual_content_approval === true;
+        row.manual_approval_debug = generated.manual_approval_debug || null;
         row.manual_override_eligible = generated.manual_override_eligible === true;
         row.effective_safe_to_write = row.safe_to_write || (row.manual_content_approval && row.manual_override_eligible);
         row.source_hash = generated.source_hash;
@@ -243,7 +244,7 @@ app.post('/admin/generate-all-products', async (req, res) => {
     }
 
     return res.status(200).json({
-      stage: write ? '4I-bulk-write-manual-approval' : '4I-bulk-preview-manual-approval',
+      stage: write ? '4J-bulk-write-direct-manual-approval' : '4J-bulk-preview-direct-manual-approval',
       writes_to_shopify: write,
       sync_sources: syncSources,
       delay_ms: delayMs,

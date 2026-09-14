@@ -13,6 +13,17 @@ const CONTENT_PRODUCT_QUERY = `#graphql
       id
       title
       handle
+
+      manualContentApproval: metafield(
+        namespace: "custom"
+        key: "manual_content_approval"
+      ) {
+        key
+        namespace
+        type
+        value
+      }
+
       metafields(first: 100, namespace: "custom") {
         nodes {
           key
@@ -117,7 +128,12 @@ export async function generateProductContent(productGid, { write = false } = {})
 
   if (!product) throw new Error(`Product not found: ${productGid}`);
 
-  const manualApproved = metafieldBoolean(product, 'manual_content_approval');
+  const manualApprovalRaw = String(product?.manualContentApproval?.value ?? '').trim();
+  const manualApprovalNormalized = manualApprovalRaw.toLowerCase();
+  const manualApproved =
+    manualApprovalNormalized === 'true' ||
+    manualApprovalNormalized === '1' ||
+    manualApprovalNormalized === 'yes';
 
   const approvedSource = buildApprovedSource(product);
   if (!Object.keys(approvedSource.facts || {}).length) {
@@ -143,10 +159,17 @@ export async function generateProductContent(productGid, { write = false } = {})
   }
 
   return {
-    stage: write ? '4I-write-manual-approval' : '4I-preview-manual-approval',
+    stage: write ? '4J-write-direct-manual-approval' : '4J-preview-direct-manual-approval',
     writes_to_shopify: Boolean(write),
     product: approvedSource.product,
     source_hash: hash,
+    manual_approval_debug: {
+      found: Boolean(product?.manualContentApproval),
+      key: product?.manualContentApproval?.key || null,
+      namespace: product?.manualContentApproval?.namespace || null,
+      type: product?.manualContentApproval?.type || null,
+      raw_value: product?.manualContentApproval?.value ?? null,
+    },
     manual_content_approval: manualApproved,
     manual_override_eligible: manualApproved && !(validation.hard_issues || []).some((issue) => ['DISEASE_OR_HIGH_RISK_CLAIM', 'INVALID_CLAIM_TYPE'].includes(issue?.code)),
     fact_fields: Object.keys(approvedSource.facts || {}),
