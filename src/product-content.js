@@ -261,10 +261,32 @@ export async function getProductContentAutomationState(productGid) {
   // turning the Shopify boolean to true is the signal to retry automatically.
   // If manual approval was already tried and still could not be applied (for
   // example a non-bypassable disease claim), do not loop on every webhook.
+  const previousHardIssues = Array.isArray(previousReview?.hard_issues)
+    ? previousReview.hard_issues
+    : [];
+
+  const previousNonBypassableIssue = previousHardIssues.some((issue) =>
+    ['DISEASE_OR_HIGH_RISK_CLAIM', 'INVALID_CLAIM_TYPE'].includes(issue?.code)
+  );
+
+  // A merchant may approve a product after it is already in needs_review.
+  // Do not rely only on detecting the first false -> true transition because an
+  // earlier failed attempt may already have stored manual_content_approval=true
+  // in content_review while the actual display metafields are still missing.
+  // If approval is currently true, the product still needs review, and required
+  // generated content is incomplete, retry automatically unless the previous
+  // failure was a deliberately non-bypassable disease/invalid-claim issue.
+  const manualApprovalNeedsContent =
+    manualApproved === true &&
+    contentStatus === 'needs_review' &&
+    !hasCompleteGeneratedContent &&
+    !previousNonBypassableIssue;
+
   const manualApprovalJustGranted =
     manualApproved === true &&
     contentStatus === 'needs_review' &&
-    previousReview?.manual_content_approval !== true;
+    previousReview?.manual_content_approval !== true &&
+    !previousNonBypassableIssue;
 
   const approvedButMissingDisplayContent =
     approvedStatuses.has(contentStatus) && !hasCompleteGeneratedContent;
@@ -281,6 +303,9 @@ export async function getProductContentAutomationState(productGid) {
   } else if (manualApprovalJustGranted) {
     shouldGenerate = true;
     reason = 'manual_approval_granted';
+  } else if (manualApprovalNeedsContent) {
+    shouldGenerate = true;
+    reason = 'manual_approval_missing_content';
   } else if (approvedButMissingDisplayContent) {
     shouldGenerate = true;
     reason = 'approved_content_missing';
@@ -302,6 +327,7 @@ export async function getProductContentAutomationState(productGid) {
     source_changed: sourceChanged,
     previous_manual_approval_seen: previousReview?.manual_content_approval === true,
     previous_manual_approval_applied: previousReview?.manual_approval_applied === true,
+    previous_non_bypassable_issue: previousNonBypassableIssue,
   };
 }
 
@@ -339,7 +365,7 @@ export async function generateProductContent(productGid, { write = false } = {})
   );
 
   return {
-    stage: write ? '4K-write-auto-webhook-manual-approval' : '4K-preview-auto-webhook-manual-approval',
+    stage: write ? '4M-write-manual-approval-retry' : '4M-preview-manual-approval-retry',
     writes_to_shopify: Boolean(write),
     product: approvedSource.product,
     source_hash: hash,
