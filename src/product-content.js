@@ -214,12 +214,44 @@ export async function getProductContentAutomationState(productGid) {
   const manualApproved = parseBooleanValue(product?.manualContentApproval?.value);
   const previousReview = parseJsonValue(product?.contentReview?.value, {}) || {};
 
-  const hasGeneratedContent = [
-    product?.productSummary,
-    product?.ingredientStory,
-    product?.formulaHighlights,
-    product?.usageDisplay,
-  ].some(hasMeaningfulMetafield);
+  // Track generated display fields individually. Using `.some(...)` here was too
+  // permissive: a populated product_summary could make the product look complete
+  // even when ingredient_story was [], formula_highlights was [], and usage_display
+  // was blank. That caused approved products to be incorrectly skipped as up_to_date.
+  const generatedFieldState = {
+    product_summary: hasMeaningfulMetafield(product?.productSummary),
+    ingredient_story: hasMeaningfulMetafield(product?.ingredientStory),
+    formula_highlights: hasMeaningfulMetafield(product?.formulaHighlights),
+    usage_display: hasMeaningfulMetafield(product?.usageDisplay),
+  };
+
+  const hasGeneratedContent = Object.values(generatedFieldState).some(Boolean);
+
+  // Require only fields that the source can reasonably support. This avoids
+  // regeneration loops on products that truly lack usage or formula data.
+  const requiredGeneratedFields = ['product_summary'];
+
+  const sourceFacts = approvedSource.facts || {};
+  const ingredientFacts = Array.isArray(sourceFacts.ingredient_highlights)
+    ? sourceFacts.ingredient_highlights
+    : [];
+
+  if (ingredientFacts.length > 0) {
+    requiredGeneratedFields.push('ingredient_story');
+  }
+
+  if (approvedSource.has_source_claim_text === true || approvedSource.source_claim_text) {
+    requiredGeneratedFields.push('formula_highlights');
+  }
+
+  if (sourceFacts.suggested_use || sourceFacts.serving_size || sourceFacts.servings_per_container) {
+    requiredGeneratedFields.push('usage_display');
+  }
+
+  const missingGeneratedFields = requiredGeneratedFields.filter(
+    (key) => generatedFieldState[key] !== true,
+  );
+  const hasCompleteGeneratedContent = missingGeneratedFields.length === 0;
 
   const approvedStatuses = new Set(['approved', 'approved_manual', 'approved_with_notes']);
   const sourceChanged = Boolean(storedHash) && storedHash !== currentHash;
@@ -235,7 +267,7 @@ export async function getProductContentAutomationState(productGid) {
     previousReview?.manual_content_approval !== true;
 
   const approvedButMissingDisplayContent =
-    approvedStatuses.has(contentStatus) && !hasGeneratedContent;
+    approvedStatuses.has(contentStatus) && !hasCompleteGeneratedContent;
 
   let reason = 'up_to_date';
   let shouldGenerate = false;
@@ -261,6 +293,10 @@ export async function getProductContentAutomationState(productGid) {
     manual_content_approval: manualApproved,
     content_status: contentStatus || null,
     has_generated_content: hasGeneratedContent,
+    has_complete_generated_content: hasCompleteGeneratedContent,
+    generated_field_state: generatedFieldState,
+    required_generated_fields: requiredGeneratedFields,
+    missing_generated_fields: missingGeneratedFields,
     current_source_hash: currentHash,
     stored_source_hash: storedHash || null,
     source_changed: sourceChanged,

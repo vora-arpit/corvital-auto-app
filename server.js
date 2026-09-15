@@ -305,7 +305,7 @@ app.post('/admin/generate-all-products', async (req, res) => {
     }
 
     return res.status(200).json({
-      stage: write ? '4K-bulk-write-auto-webhook' : '4K-bulk-preview-auto-webhook',
+      stage: write ? '4L-bulk-write-auto-webhook' : '4L-bulk-preview-auto-webhook',
       writes_to_shopify: write,
       sync_sources: syncSources,
       delay_ms: delayMs,
