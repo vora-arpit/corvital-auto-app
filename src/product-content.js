@@ -1,10 +1,7 @@
 import { shopifyGraphQL } from './shopify.js';
 import { buildApprovedSource, sourceFingerprint } from './source-builder.js';
 import { generateGroundedContent } from './claude-content.js';
-import {
-  validateGeneratedContent,
-  buildPublishableContent,
-} from './compliance-validator.js';
+import { validateGeneratedContent } from './compliance-validator.js';
 import { GENERATED_METAFIELD_TYPES } from './content-schema.js';
 
 const CONTENT_PRODUCT_QUERY = `#graphql
@@ -14,10 +11,7 @@ const CONTENT_PRODUCT_QUERY = `#graphql
       title
       handle
 
-      manualContentApproval: metafield(
-        namespace: "custom"
-        key: "manual_content_approval"
-      ) {
+      manualContentApproval: metafield(namespace: "custom", key: "manual_content_approval") {
         key
         namespace
         type
@@ -86,6 +80,11 @@ const SET_METAFIELDS = `#graphql
   }
 `;
 
+const NON_BYPASSABLE_CODES = new Set([
+  'DISEASE_OR_HIGH_RISK_CLAIM',
+  'INVALID_CLAIM_TYPE',
+]);
+
 function serialize(value) {
   return typeof value === 'string' ? value : JSON.stringify(value);
 }
@@ -105,11 +104,69 @@ function parseJsonValue(value, fallback = null) {
   }
 }
 
-function hasMeaningfulMetafield(node) {
-  if (!node || node.value === null || node.value === undefined) return false;
-  const raw = String(node.value).trim();
-  if (!raw || raw === 'null' || raw === '[]' || raw === '{}') return false;
-  return true;
+function appendClaimAsterisk(text) {
+  const value = String(text || '').trim();
+  if (!value) return value;
+  if (/\*\s*[.!?]?$/.test(value)) return value;
+
+  const punctuation = value.match(/([.!?])$/);
+  if (punctuation) {
+    return `${value.slice(0, -1)}*${punctuation[1]}`;
+  }
+  return `${value}*`;
+}
+
+function reviewDraftTextObject(value) {
+  if (!value || typeof value !== 'object') return value;
+  const copy = { ...value };
+
+  if (copy.claim_type === 'source_claim' || copy.claim_type === 'approved_claim') {
+    // For the review draft, prefer the source quote rather than Claude's paraphrase.
+    // The merchant reviews exactly what can later appear on the storefront.
+    const sourceText = String(copy.source_quote || '').trim();
+    copy.text = appendClaimAsterisk(sourceText || copy.text);
+  }
+
+  return copy;
+}
+
+/**
+ * Build a complete review draft regardless of normal validation result.
+ * This is intentionally stored in Shopify but hidden from the storefront until
+ * custom.manual_content_approval is true.
+ */
+function buildReviewDraft(content) {
+  const output = JSON.parse(JSON.stringify(content || {}));
+
+  if (output.product_summary) {
+    output.product_summary = reviewDraftTextObject(output.product_summary);
+  }
+
+  if (Array.isArray(output.ingredient_story)) {
+    output.ingredient_story = output.ingredient_story.map((story) => ({
+      ...story,
+      what_it_is: reviewDraftTextObject(story?.what_it_is),
+      why_in_formula: reviewDraftTextObject(story?.why_in_formula),
+    }));
+  } else {
+    output.ingredient_story = [];
+  }
+
+  if (Array.isArray(output.formula_highlights)) {
+    output.formula_highlights = output.formula_highlights.map(reviewDraftTextObject);
+  } else {
+    output.formula_highlights = [];
+  }
+
+  if (!output.usage_display) output.usage_display = null;
+
+  return output;
+}
+
+function hasNonBypassableIssue(validation) {
+  return (validation?.hard_issues || []).some((issue) =>
+    NON_BYPASSABLE_CODES.has(issue?.code)
+  );
 }
 
 async function fetchContentProduct(productGid) {
@@ -119,54 +176,18 @@ async function fetchContentProduct(productGid) {
   return product;
 }
 
-async function writeGeneratedMetafields(productId, content, validation, hash, { manualApproved = false } = {}) {
-  const publishableContent = buildPublishableContent(content, validation, {
-    manualOverride: manualApproved,
-  });
-
-  const normalWrite = Boolean(publishableContent) && validation.safe_to_write_publishable_preview === true;
-  const manualWrite = Boolean(publishableContent) && manualApproved === true && !normalWrite;
-  const canWrite = normalWrite || manualWrite;
-
-  const status = !canWrite
-    ? 'needs_review'
-    : manualWrite
-      ? 'approved_manual'
-      : validation.requires_review
-        ? 'approved_with_notes'
-        : 'approved';
-
-  const reviewForStorage = {
-    ...validation,
-    manual_content_approval: manualApproved,
-    manual_approval_applied: manualWrite,
-  };
-
-  const fields = canWrite
-    ? {
-        product_summary: publishableContent.product_summary,
-        ingredient_story: publishableContent.ingredient_story || [],
-        formula_highlights: publishableContent.formula_highlights || [],
-        usage_display: publishableContent.usage_display,
-        content_status: status,
-        content_review: reviewForStorage,
-        content_source_hash: hash,
-      }
-    : {
-        content_status: status,
-        content_review: reviewForStorage,
-        content_source_hash: hash,
-      };
-
+async function setMetafields(productId, fields) {
   const metafields = Object.entries(fields)
     .filter(([, value]) => value !== null && value !== undefined)
     .map(([key, value]) => ({
       ownerId: productId,
       namespace: 'custom',
       key,
-      type: GENERATED_METAFIELD_TYPES[key],
+      type: key === 'manual_content_approval' ? 'boolean' : GENERATED_METAFIELD_TYPES[key],
       value: serialize(value),
     }));
+
+  if (!metafields.length) return [];
 
   const data = await shopifyGraphQL(SET_METAFIELDS, { metafields });
   const result = data.metafieldsSet;
@@ -175,169 +196,203 @@ async function writeGeneratedMetafields(productId, content, validation, hash, { 
     throw new Error(`Generated metafield write failed: ${JSON.stringify(result.userErrors)}`);
   }
 
-  return result.metafields;
+  return result.metafields || [];
 }
 
 /**
- * Cheap preflight used by the Shopify product webhook.
- * It does NOT call Claude.
+ * Save a generated draft every time Claude runs.
  *
- * It triggers content generation only when:
- * 1) this product has never been generated before,
- * 2) source facts changed (source hash differs),
- * 3) a previously reviewed product was manually approved by the merchant, or
- * 4) an approved product is missing its generated display metafields.
+ * Important Stage 4N behavior:
+ * - Generated display fields are saved even when validation says needs_review.
+ * - Every fresh generation resets manual_content_approval to false.
+ * - Storefront visibility is controlled later by the Shopify boolean, not by
+ *   another Claude call.
+ */
+async function writeGeneratedDraft(productId, content, validation, hash) {
+  const draft = buildReviewDraft(content);
+  const blocked = hasNonBypassableIssue(validation);
+
+  const status = blocked
+    ? 'blocked'
+    : validation?.passed === true
+      ? 'awaiting_approval'
+      : 'needs_review';
+
+  const reviewForStorage = {
+    ...validation,
+    draft_saved: true,
+    manual_content_approval: false,
+    approval_required_for_storefront: true,
+  };
+
+  const fields = {
+    product_summary: draft.product_summary || null,
+    ingredient_story: draft.ingredient_story || [],
+    formula_highlights: draft.formula_highlights || [],
+    usage_display: draft.usage_display || null,
+    content_status: status,
+    content_review: reviewForStorage,
+    content_source_hash: hash,
+    manual_content_approval: false,
+  };
+
+  return setMetafields(productId, fields);
+}
+
+/**
+ * No-Claude approval sync.
+ * Called after the merchant toggles Manual content approval in Shopify.
+ */
+export async function syncManualApprovalStatus(productGid) {
+  const product = await fetchContentProduct(productGid);
+  const manualApproved = parseBooleanValue(product?.manualContentApproval?.value);
+  const review = parseJsonValue(product?.contentReview?.value, {}) || {};
+  const blocked = hasNonBypassableIssue(review);
+
+  let status;
+  if (blocked) {
+    status = 'blocked';
+  } else if (manualApproved) {
+    status = 'approved_manual';
+  } else if (review?.passed === true) {
+    status = 'awaiting_approval';
+  } else {
+    status = 'needs_review';
+  }
+
+  const effectiveManualApproval = blocked ? false : manualApproved;
+
+  const fields = {
+    content_status: status,
+    content_review: {
+      ...review,
+      manual_content_approval: effectiveManualApproval,
+      approval_required_for_storefront: true,
+    },
+  };
+
+  // A non-bypassable disease/high-risk issue can never be made visible by the
+  // approval switch. Reset the boolean so Shopify accurately reflects that.
+  if (blocked && manualApproved) {
+    fields.manual_content_approval = false;
+  }
+
+  const written = await setMetafields(product.id, fields);
+
+  return {
+    product: { id: product.id, title: product.title, handle: product.handle },
+    manual_content_approval: blocked ? false : manualApproved,
+    content_status: status,
+    blocked,
+    written_metafields: written.map((item) => item.key),
+  };
+}
+
+/**
+ * Cheap webhook preflight. It never calls Claude.
  *
- * This prevents price/inventory/image/metafield update webhooks from wasting
- * Claude credits and prevents generated-metafield writes from causing loops.
+ * Claude should run only when:
+ * 1) product has never generated content, or
+ * 2) authoritative source hash changed.
+ *
+ * Manual approval changes NEVER trigger Claude in Stage 4N.
  */
 export async function getProductContentAutomationState(productGid) {
   const product = await fetchContentProduct(productGid);
   const approvedSource = buildApprovedSource(product);
   const factCount = Object.keys(approvedSource.facts || {}).length;
+  const manualApproved = parseBooleanValue(product?.manualContentApproval?.value);
+  const contentStatus = String(product?.contentStatus?.value || '').trim();
+  const storedHash = String(product?.contentSourceHash?.value || '').trim();
 
   if (!factCount) {
     return {
+      action: 'skip',
       should_generate: false,
+      should_sync_approval: false,
       reason: 'no_source_facts',
       product: approvedSource.product,
-      manual_content_approval: parseBooleanValue(product?.manualContentApproval?.value),
-      content_status: String(product?.contentStatus?.value || ''),
+      manual_content_approval: manualApproved,
+      content_status: contentStatus || null,
       current_source_hash: null,
-      stored_source_hash: String(product?.contentSourceHash?.value || ''),
+      stored_source_hash: storedHash || null,
     };
   }
 
   const currentHash = sourceFingerprint(approvedSource);
-  const storedHash = String(product?.contentSourceHash?.value || '').trim();
-  const contentStatus = String(product?.contentStatus?.value || '').trim();
-  const manualApproved = parseBooleanValue(product?.manualContentApproval?.value);
-  const previousReview = parseJsonValue(product?.contentReview?.value, {}) || {};
-
-  // Track generated display fields individually. Using `.some(...)` here was too
-  // permissive: a populated product_summary could make the product look complete
-  // even when ingredient_story was [], formula_highlights was [], and usage_display
-  // was blank. That caused approved products to be incorrectly skipped as up_to_date.
-  const generatedFieldState = {
-    product_summary: hasMeaningfulMetafield(product?.productSummary),
-    ingredient_story: hasMeaningfulMetafield(product?.ingredientStory),
-    formula_highlights: hasMeaningfulMetafield(product?.formulaHighlights),
-    usage_display: hasMeaningfulMetafield(product?.usageDisplay),
-  };
-
-  const hasGeneratedContent = Object.values(generatedFieldState).some(Boolean);
-
-  // Require only fields that the source can reasonably support. This avoids
-  // regeneration loops on products that truly lack usage or formula data.
-  const requiredGeneratedFields = ['product_summary'];
-
-  const sourceFacts = approvedSource.facts || {};
-  const ingredientFacts = Array.isArray(sourceFacts.ingredient_highlights)
-    ? sourceFacts.ingredient_highlights
-    : [];
-
-  if (ingredientFacts.length > 0) {
-    requiredGeneratedFields.push('ingredient_story');
-  }
-
-  if (approvedSource.has_source_claim_text === true || approvedSource.source_claim_text) {
-    requiredGeneratedFields.push('formula_highlights');
-  }
-
-  if (sourceFacts.suggested_use || sourceFacts.serving_size || sourceFacts.servings_per_container) {
-    requiredGeneratedFields.push('usage_display');
-  }
-
-  const missingGeneratedFields = requiredGeneratedFields.filter(
-    (key) => generatedFieldState[key] !== true,
-  );
-  const hasCompleteGeneratedContent = missingGeneratedFields.length === 0;
-
-  const approvedStatuses = new Set(['approved', 'approved_manual', 'approved_with_notes']);
+  const neverGenerated = !storedHash;
   const sourceChanged = Boolean(storedHash) && storedHash !== currentHash;
-  const neverGenerated = !storedHash && !contentStatus;
-
-  // When the app previously stored needs_review with manual approval = false,
-  // turning the Shopify boolean to true is the signal to retry automatically.
-  // If manual approval was already tried and still could not be applied (for
-  // example a non-bypassable disease claim), do not loop on every webhook.
-  const previousHardIssues = Array.isArray(previousReview?.hard_issues)
-    ? previousReview.hard_issues
-    : [];
-
-  const previousNonBypassableIssue = previousHardIssues.some((issue) =>
-    ['DISEASE_OR_HIGH_RISK_CLAIM', 'INVALID_CLAIM_TYPE'].includes(issue?.code)
-  );
-
-  // A merchant may approve a product after it is already in needs_review.
-  // Do not rely only on detecting the first false -> true transition because an
-  // earlier failed attempt may already have stored manual_content_approval=true
-  // in content_review while the actual display metafields are still missing.
-  // If approval is currently true, the product still needs review, and required
-  // generated content is incomplete, retry automatically unless the previous
-  // failure was a deliberately non-bypassable disease/invalid-claim issue.
-  const manualApprovalNeedsContent =
-    manualApproved === true &&
-    contentStatus === 'needs_review' &&
-    !hasCompleteGeneratedContent &&
-    !previousNonBypassableIssue;
-
-  const manualApprovalJustGranted =
-    manualApproved === true &&
-    contentStatus === 'needs_review' &&
-    previousReview?.manual_content_approval !== true &&
-    !previousNonBypassableIssue;
-
-  const approvedButMissingDisplayContent =
-    approvedStatuses.has(contentStatus) && !hasCompleteGeneratedContent;
-
-  let reason = 'up_to_date';
-  let shouldGenerate = false;
+  const previousReview = parseJsonValue(product?.contentReview?.value, {}) || {};
+  const previousManualApproval = previousReview?.manual_content_approval === true;
+  const approvalChanged = previousManualApproval !== manualApproved;
 
   if (neverGenerated) {
-    shouldGenerate = true;
-    reason = 'new_product_or_never_generated';
-  } else if (sourceChanged) {
-    shouldGenerate = true;
-    reason = 'source_changed';
-  } else if (manualApprovalJustGranted) {
-    shouldGenerate = true;
-    reason = 'manual_approval_granted';
-  } else if (manualApprovalNeedsContent) {
-    shouldGenerate = true;
-    reason = 'manual_approval_missing_content';
-  } else if (approvedButMissingDisplayContent) {
-    shouldGenerate = true;
-    reason = 'approved_content_missing';
+    return {
+      action: 'generate',
+      should_generate: true,
+      should_sync_approval: false,
+      reason: 'new_product_or_never_generated',
+      product: approvedSource.product,
+      manual_content_approval: manualApproved,
+      content_status: contentStatus || null,
+      current_source_hash: currentHash,
+      stored_source_hash: null,
+      source_changed: false,
+      approval_changed: approvalChanged,
+    };
+  }
+
+  if (sourceChanged) {
+    return {
+      action: 'generate',
+      should_generate: true,
+      should_sync_approval: false,
+      reason: 'source_changed',
+      product: approvedSource.product,
+      manual_content_approval: manualApproved,
+      content_status: contentStatus || null,
+      current_source_hash: currentHash,
+      stored_source_hash: storedHash,
+      source_changed: true,
+      approval_changed: approvalChanged,
+    };
+  }
+
+  if (approvalChanged) {
+    return {
+      action: 'approval_sync',
+      should_generate: false,
+      should_sync_approval: true,
+      reason: manualApproved ? 'manual_approval_enabled' : 'manual_approval_disabled',
+      product: approvedSource.product,
+      manual_content_approval: manualApproved,
+      content_status: contentStatus || null,
+      current_source_hash: currentHash,
+      stored_source_hash: storedHash,
+      source_changed: false,
+      approval_changed: true,
+    };
   }
 
   return {
-    should_generate: shouldGenerate,
-    reason,
+    action: 'skip',
+    should_generate: false,
+    should_sync_approval: false,
+    reason: 'up_to_date',
     product: approvedSource.product,
     manual_content_approval: manualApproved,
     content_status: contentStatus || null,
-    has_generated_content: hasGeneratedContent,
-    has_complete_generated_content: hasCompleteGeneratedContent,
-    generated_field_state: generatedFieldState,
-    required_generated_fields: requiredGeneratedFields,
-    missing_generated_fields: missingGeneratedFields,
     current_source_hash: currentHash,
-    stored_source_hash: storedHash || null,
-    source_changed: sourceChanged,
-    previous_manual_approval_seen: previousReview?.manual_content_approval === true,
-    previous_manual_approval_applied: previousReview?.manual_approval_applied === true,
-    previous_non_bypassable_issue: previousNonBypassableIssue,
+    stored_source_hash: storedHash,
+    source_changed: false,
+    approval_changed: false,
   };
 }
 
 export async function generateProductContent(productGid, { write = false } = {}) {
   const product = await fetchContentProduct(productGid);
-
-  const manualApprovalRaw = String(product?.manualContentApproval?.value ?? '').trim();
-  const manualApproved = parseBooleanValue(manualApprovalRaw);
-
   const approvedSource = buildApprovedSource(product);
+
   if (!Object.keys(approvedSource.facts || {}).length) {
     throw new Error(`No factual source metafields found for ${product.title}. Run source sync first.`);
   }
@@ -345,39 +400,25 @@ export async function generateProductContent(productGid, { write = false } = {})
   const hash = sourceFingerprint(approvedSource);
   const generated = await generateGroundedContent(approvedSource);
   const validation = validateGeneratedContent(generated.content, approvedSource);
-  const publishablePreview = buildPublishableContent(generated.content, validation, {
-    manualOverride: manualApproved,
-  });
+  const reviewDraft = buildReviewDraft(generated.content);
 
   let written = [];
   if (write) {
-    written = await writeGeneratedMetafields(
+    written = await writeGeneratedDraft(
       product.id,
       generated.content,
       validation,
       hash,
-      { manualApproved }
     );
   }
 
-  const nonBypassable = (validation.hard_issues || []).some((issue) =>
-    ['DISEASE_OR_HIGH_RISK_CLAIM', 'INVALID_CLAIM_TYPE'].includes(issue?.code)
-  );
-
   return {
-    stage: write ? '4M-write-manual-approval-retry' : '4M-preview-manual-approval-retry',
+    stage: write ? '4N-write-draft-approval-gate' : '4N-preview-draft-approval-gate',
     writes_to_shopify: Boolean(write),
     product: approvedSource.product,
     source_hash: hash,
-    manual_approval_debug: {
-      found: Boolean(product?.manualContentApproval),
-      key: product?.manualContentApproval?.key || null,
-      namespace: product?.manualContentApproval?.namespace || null,
-      type: product?.manualContentApproval?.type || null,
-      raw_value: product?.manualContentApproval?.value ?? null,
-    },
-    manual_content_approval: manualApproved,
-    manual_override_eligible: manualApproved && !nonBypassable,
+    manual_content_approval_before_generation: parseBooleanValue(product?.manualContentApproval?.value),
+    manual_content_approval_after_generation: write ? false : null,
     fact_fields: Object.keys(approvedSource.facts || {}),
     has_source_claim_text: Boolean(approvedSource.source_claim_text),
     approved_claims_count: (approvedSource.approved_claims || []).length,
@@ -387,9 +428,15 @@ export async function generateProductContent(productGid, { write = false } = {})
     generation_attempts: generated.attempts || 1,
     response_mode: generated.response_mode || 'unknown',
     generated: generated.content,
+    review_draft: reviewDraft,
     validation,
-    publishable_preview: publishablePreview,
-    disclaimer_strategy: 'Global footer disclaimer already present; app appends * to validated health/wellness claims only.',
+    content_status_after_generation: hasNonBypassableIssue(validation)
+      ? 'blocked'
+      : validation?.passed === true
+        ? 'awaiting_approval'
+        : 'needs_review',
+    storefront_visibility_after_generation: false,
+    disclaimer_strategy: 'Global footer disclaimer already present; app appends * to source-backed health/wellness claims in the stored review draft.',
     written_metafields: written.map((item) => item.key),
   };
 }

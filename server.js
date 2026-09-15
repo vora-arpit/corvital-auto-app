@@ -6,10 +6,11 @@ import { syncProduct, listAllProducts } from './src/sync-product.js';
 import {
   generateProductContent,
   getProductContentAutomationState,
+  syncManualApprovalStatus,
 } from './src/product-content.js';
 
 const app = express();
-const APP_VERSION = 'stage4k-auto-webhook-content-2026-09-14';
+const APP_VERSION = 'stage4n-draft-save-approval-gate-2026-09-15';
 const seenWebhookIds = new Map();
 const productAutomationLocks = new Map();
 
@@ -59,43 +60,61 @@ async function runAutomaticProductContent(productGid, topic = 'unknown') {
   }
 
   const task = (async () => {
-    // First refresh deterministic Supliful/source metafields.
+    // Always refresh deterministic source metafields first.
     const sourceSync = await syncProduct(productGid);
 
-    // Cheap GraphQL/hash check. This does NOT call Claude.
+    // Cheap state check. No Claude call occurs here.
     const state = await getProductContentAutomationState(productGid);
 
-    if (!state.should_generate) {
-      console.log(`[auto-content] ${topic} ${productGid} skipped: ${state.reason}`);
+    if (state.should_generate) {
+      console.log(`[auto-content] ${topic} ${productGid} generating once: ${state.reason}`);
+
+      // Stage 4N saves the complete generated draft even when validation says
+      // needs_review, then resets Manual content approval to false.
+      const generated = await generateProductContent(productGid, { write: true });
+
       return {
-        skipped: true,
+        skipped: false,
+        action: 'generated_draft',
         reason: state.reason,
+        claude_called: true,
         source_sync: sourceSync,
         state,
+        result: {
+          validation_passed: generated.validation?.passed === true,
+          requires_review: generated.validation?.requires_review === true,
+          content_status_after_generation: generated.content_status_after_generation,
+          storefront_visibility_after_generation: false,
+          written_metafields: generated.written_metafields || [],
+        },
       };
     }
 
-    console.log(`[auto-content] ${topic} ${productGid} generating: ${state.reason}`);
+    if (state.should_sync_approval) {
+      console.log(`[auto-content] ${topic} ${productGid} approval-only sync: ${state.reason}`);
 
-    // Write=true because automatic runs are intended to populate the storefront.
-    // If validation requires review, generateProductContent writes only status/review/hash.
-    // When you later set Manual content approval = true and Save in Shopify, the next
-    // PRODUCTS_UPDATE webhook re-enters here and writes the generated content automatically.
-    const generated = await generateProductContent(productGid, { write: true });
+      // IMPORTANT: approval changes do not call Claude.
+      const approvalResult = await syncManualApprovalStatus(productGid);
 
+      return {
+        skipped: false,
+        action: 'approval_sync',
+        reason: state.reason,
+        claude_called: false,
+        source_sync: sourceSync,
+        state,
+        result: approvalResult,
+      };
+    }
+
+    console.log(`[auto-content] ${topic} ${productGid} skipped: ${state.reason}`);
     return {
-      skipped: false,
+      skipped: true,
+      action: 'skip',
       reason: state.reason,
+      claude_called: false,
       source_sync: sourceSync,
       state,
-      result: {
-        validation_passed: generated.validation?.passed === true,
-        requires_review: generated.validation?.requires_review === true,
-        manual_content_approval: generated.manual_content_approval === true,
-        manual_override_eligible: generated.manual_override_eligible === true,
-        written_metafields: generated.written_metafields || [],
-        content_status_written: (generated.written_metafields || []).includes('content_status'),
-      },
     };
   })();
 
@@ -114,6 +133,7 @@ app.get('/', (_req, res) => {
     status: 'running',
     version: APP_VERSION,
     automaticProductContent: true,
+    approvalGateMode: true,
     health: '/health',
     webhook: '/webhooks/products',
     contentGenerator: '/admin/generate-product-content/:productId',
@@ -128,6 +148,7 @@ app.get('/health', (_req, res) => {
     service: 'corvital-metafield-automation',
     version: APP_VERSION,
     automatic_product_content: true,
+    approval_gate_mode: true,
     timestamp: new Date().toISOString(),
   });
 });
@@ -203,9 +224,19 @@ app.post('/admin/generate-product-content/:productId', async (req, res) => {
   }
 
   const write = req.body?.write === true;
+  const approvalOnly = req.body?.approval_only === true;
   const productGid = `gid://shopify/Product/${numericProductId}`;
 
   try {
+    if (approvalOnly) {
+      const result = await syncManualApprovalStatus(productGid);
+      return res.status(200).json({
+        stage: '4N-approval-only-no-claude',
+        claude_called: false,
+        ...result,
+      });
+    }
+
     const result = await generateProductContent(productGid, { write });
     return res.status(200).json(result);
   } catch (error) {
@@ -270,10 +301,9 @@ app.post('/admin/generate-all-products', async (req, res) => {
         row.validation_passed = generated.validation?.passed === true;
         row.requires_review = generated.validation?.requires_review === true;
         row.safe_to_write = generated.validation?.safe_to_write_publishable_preview === true;
-        row.manual_content_approval = generated.manual_content_approval === true;
-        row.manual_approval_debug = generated.manual_approval_debug || null;
-        row.manual_override_eligible = generated.manual_override_eligible === true;
-        row.effective_safe_to_write = row.safe_to_write || (row.manual_content_approval && row.manual_override_eligible);
+        row.manual_content_approval_after_generation = generated.manual_content_approval_after_generation;
+        row.content_status_after_generation = generated.content_status_after_generation;
+        row.storefront_visibility_after_generation = generated.storefront_visibility_after_generation;
         row.source_hash = generated.source_hash;
         row.model = generated.model;
         row.generation_attempts = generated.generation_attempts || 1;
@@ -305,7 +335,7 @@ app.post('/admin/generate-all-products', async (req, res) => {
     }
 
     return res.status(200).json({
-      stage: write ? '4M-bulk-write-manual-approval-retry' : '4M-bulk-preview-manual-approval-retry',
+      stage: write ? '4N-bulk-write-drafts-approval-gate' : '4N-bulk-preview-drafts-approval-gate',
       writes_to_shopify: write,
       sync_sources: syncSources,
       delay_ms: delayMs,
